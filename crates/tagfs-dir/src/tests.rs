@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use tagfs_core::{Change, EntityId, IdSource, Tag, Unit, UnitError, UnitId};
 
@@ -27,7 +28,7 @@ fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tagfs-dir-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    fs::canonicalize(dir).unwrap()
 }
 
 fn eid(n: u64) -> EntityId {
@@ -42,7 +43,7 @@ fn p(v: &str) -> Tag {
 
 fn fresh(name: &str) -> (PathBuf, DirUnit) {
     let root = scratch(name);
-    let (unit, _) = DirUnit::create(&root, UnitId([3; 16]), 64 << 20, ids()).unwrap();
+    let (unit, _) = DirUnit::create(&root, UnitId([3; 16]), ids()).unwrap();
     (root, unit)
 }
 
@@ -68,6 +69,15 @@ fn image_size(u: &DirUnit, id: &EntityId) -> u64 {
     u.image().snapshot().get(id).unwrap().unwrap().size
 }
 
+/// 等宿主改动的通知到达并同步进来。
+fn eventually(mut ok: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !ok() {
+        assert!(start.elapsed() < Duration::from_secs(5), "host change was not picked up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn existing_files_become_entities_with_their_paths() {
     let root = scratch("scan");
@@ -77,7 +87,7 @@ fn existing_files_become_entities_with_their_paths() {
     #[cfg(unix)]
     std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
 
-    let (unit, report) = DirUnit::create(&root, UnitId([1; 16]), 64 << 20, ids()).unwrap();
+    let (unit, report) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
     assert_eq!(report.added, 2);
     #[cfg(unix)]
     assert_eq!(report.skipped, 1, "the symlink is neither mapped nor followed");
@@ -108,6 +118,31 @@ fn a_path_creates_the_file_and_missing_directories() {
     names.sort();
     assert_eq!(names, [".tagfs", "abc"].map(std::ffi::OsString::from));
     assert!(!root.join(".tagfs/tmp").exists());
+}
+
+#[test]
+fn writes_go_straight_to_the_host_file() {
+    let (root, mut unit) = fresh("direct");
+    // 一个 16 MiB 的宿主文件，写一个字节、截短、再写。
+    let big = vec![7u8; 16 << 20];
+    fs::write(root.join("big.bin"), &big).unwrap();
+    unit.rescan().unwrap();
+    let id = by_path(&unit, "/big.bin").unwrap();
+    let image_before = unit.image().total_blocks();
+    unit.apply(&[
+        Change::Write { id, offset: 5, data: b"X".to_vec() },
+        Change::Truncate { id, len: 10 << 20 },
+        Change::Write { id, offset: (12 << 20) - 1, data: b"Y".to_vec() },
+    ])
+    .unwrap();
+    let now = fs::read(root.join("big.bin")).unwrap();
+    assert_eq!(now.len(), 12 << 20);
+    assert_eq!(now[5], b'X');
+    assert_eq!(now[(10 << 20) - 1], 7);
+    assert!(now[10 << 20..(12 << 20) - 1].iter().all(|&b| b == 0));
+    assert_eq!(now[(12 << 20) - 1], b'Y');
+    assert_eq!(image_size(&unit, &id), 0, "nothing went through the image");
+    assert_eq!(unit.image().total_blocks(), image_before, "the image did not have to grow");
 }
 
 #[test]
@@ -151,9 +186,14 @@ fn changing_the_path_tag_moves_removes_or_materialises_the_file() {
     assert_eq!(fs::read(root.join("c.txt")).unwrap(), b"three");
     assert_eq!(image_size(&unit, &eid(3)), 0);
 
-    // 写内容、删除。
-    unit.apply(&[Change::Write { id: eid(1), offset: 3, data: b"!".to_vec() }]).unwrap();
-    assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"one!");
+    // 写、改名在同一次里：写进原文件，再移过去。
+    unit.apply(&[
+        Change::Write { id: eid(1), offset: 3, data: b"!".to_vec() },
+        Change::RemoveTag { id: eid(1), tag: p("/b.txt") },
+        Change::AddTag { id: eid(1), tag: p("/f.txt") },
+    ])
+    .unwrap();
+    assert_eq!(fs::read(root.join("f.txt")).unwrap(), b"one!");
     unit.apply(&[Change::Delete { id: eid(3) }]).unwrap();
     assert!(!root.join("c.txt").exists());
     unit.image().verify().unwrap();
@@ -164,14 +204,25 @@ fn copies_follow_the_target_path() {
     let (root, mut unit) = fresh("copy");
     unit.apply(&[Change::Create { id: eid(1), tags: vec![p("/src")], content: b"payload".to_vec() }]).unwrap();
     unit.apply(&[
+        Change::Write { id: eid(1), offset: 0, data: b"P".to_vec() },
         Change::Copy { from: eid(1), id: eid(2), tags: vec![p("/dst")] },
         Change::Copy { from: eid(1), id: eid(3), tags: vec![] },
     ])
     .unwrap();
-    assert_eq!(fs::read(root.join("dst")).unwrap(), b"payload");
-    assert_eq!(fs::read(root.join("src")).unwrap(), b"payload");
-    assert_eq!(content(&unit, &eid(3)), b"payload");
+    assert_eq!(fs::read(root.join("dst")).unwrap(), b"Payload");
+    assert_eq!(fs::read(root.join("src")).unwrap(), b"Payload");
+    assert_eq!(content(&unit, &eid(3)), b"Payload");
     assert_eq!(image_size(&unit, &eid(1)), 0);
+    assert_eq!(image_size(&unit, &eid(2)), 0);
+
+    // 复制之后再改源：复制品不受影响。
+    unit.apply(&[
+        Change::Copy { from: eid(1), id: eid(4), tags: vec![p("/dst2")] },
+        Change::Write { id: eid(1), offset: 0, data: b"Q".to_vec() },
+    ])
+    .unwrap();
+    assert_eq!(fs::read(root.join("dst2")).unwrap(), b"Payload");
+    assert_eq!(fs::read(root.join("src")).unwrap(), b"Qayload");
     unit.image().verify().unwrap();
 }
 
@@ -210,8 +261,39 @@ fn bad_or_taken_paths_change_nothing() {
         ]),
         Err(UnitError::PathTaken)
     );
+    // 删掉之后再写，和别的单元一样报“不存在”。
+    let file = by_path(&unit, "/file").unwrap();
+    assert_eq!(
+        unit.apply(&[Change::Delete { id: file }, Change::Write { id: file, offset: 0, data: b"z".to_vec() }]),
+        Err(UnitError::NotFound(file))
+    );
     assert_eq!(unit.snapshot().all().unwrap(), before);
     assert!(!root.join("same").exists());
+    assert!(root.join("file").exists());
+}
+
+#[test]
+fn host_changes_show_up_right_away() {
+    let (root, unit) = fresh("live");
+    // Linux、Windows、macOS 都有文件系统通知；别的宿主可能没有。
+    if cfg!(any(target_os = "linux", windows, target_os = "macos")) {
+        assert!(unit.is_live());
+    } else if !unit.is_live() {
+        return;
+    }
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/new.txt"), b"hi").unwrap();
+    eventually(|| by_path(&unit, "/docs/new.txt").is_some());
+    let id = by_path(&unit, "/docs/new.txt").unwrap();
+    assert_eq!(content(&unit, &id), b"hi");
+
+    fs::rename(root.join("docs"), root.join("papers")).unwrap();
+    eventually(|| by_path(&unit, "/papers/new.txt").is_some());
+    assert_eq!(by_path(&unit, "/papers/new.txt"), Some(id), "renaming the directory keeps the entity");
+    assert_eq!(by_path(&unit, "/docs/new.txt"), None);
+
+    fs::remove_file(root.join("papers/new.txt")).unwrap();
+    eventually(|| unit.snapshot().all().unwrap().is_empty());
 }
 
 #[test]
@@ -220,7 +302,7 @@ fn reopening_catches_up_with_changes_made_on_the_host() {
     fs::write(root.join("keep"), b"k").unwrap();
     fs::write(root.join("gone"), b"g").unwrap();
     fs::write(root.join("old-name"), b"r").unwrap();
-    let (mut unit, _) = DirUnit::create(&root, UnitId([1; 16]), 64 << 20, ids()).unwrap();
+    let (mut unit, _) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
     unit.apply(&[Change::Create { id: eid(9), tags: vec![], content: b"image only".to_vec() }]).unwrap();
     let keep = by_path(&unit, "/keep").unwrap();
     let renamed = by_path(&unit, "/old-name").unwrap();
@@ -234,48 +316,69 @@ fn reopening_catches_up_with_changes_made_on_the_host() {
     assert_eq!(by_path(&unit, "/gone"), None);
     assert!(by_path(&unit, "/fresh").is_some());
     assert_eq!(content(&unit, &eid(9)), b"image only");
-    #[cfg(unix)]
-    {
-        assert_eq!(by_path(&unit, "/new-name"), Some(renamed), "same entity after a rename on the host");
-        assert_eq!(report, ScanReport { added: 1, removed: 1, renamed: 1, skipped: 0 });
+    assert_eq!(by_path(&unit, "/new-name"), Some(renamed), "same entity after a rename on the host");
+    assert_eq!(report, ScanReport { added: 1, removed: 1, renamed: 1, skipped: 0 });
+}
+
+#[test]
+fn identities_follow_gits_rules() {
+    let with_id = |id: u8, size, mtime_ns| Ident { file_id: Some(vec![id]), size, mtime_ns };
+    let stat_only = |size, mtime_ns| Ident { file_id: None, size, mtime_ns };
+    // 有文件号就只看文件号：改了内容的改名也认得出，号不同就不是同一个。
+    assert!(with_id(1, 10, 5).same_file(&with_id(1, 99, 6)));
+    assert!(!with_id(1, 10, 5).same_file(&with_id(2, 10, 5)));
+    // 没有文件号时看 stat 信息，这种匹配要唯一才算。
+    assert!(stat_only(10, 5).same_file(&with_id(1, 10, 5)));
+    assert!(stat_only(10, 5).weak(&with_id(1, 10, 5)));
+    assert!(!stat_only(10, 5).same_file(&stat_only(10, 6)));
+    for i in [with_id(3, 1, 2), stat_only(4, 5)] {
+        assert_eq!(Ident::decode(&i.encode()), Some(i));
     }
-    #[cfg(not(unix))]
-    let _ = (renamed, report);
 }
 
 /// 第 1 步提交之后、宿主操作做完之前断电：挂载时把剩下的做完。
 #[test]
 fn an_interrupted_change_is_finished_when_reopened() {
-    for stop_after_host_ops in [false, true] {
-        let (root, mut unit) = fresh(&format!("recover-{stop_after_host_ops}"));
+    for stage in 0..3 {
+        let (root, mut unit) = fresh(&format!("recover-{stage}"));
         unit.apply(&[
             Change::Create { id: eid(1), tags: vec![p("/a")], content: b"A".to_vec() },
             Change::Create { id: eid(2), tags: vec![p("/b")], content: b"B".to_vec() },
         ])
         .unwrap();
         let changes = [
+            Change::Write { id: eid(1), offset: 1, data: b"1".to_vec() },
             Change::RemoveTag { id: eid(1), tag: p("/a") },
             Change::RemoveTag { id: eid(2), tag: p("/b") },
             Change::AddTag { id: eid(1), tag: p("/b") },
             Change::AddTag { id: eid(2), tag: p("/x/a") },
             Change::Create { id: eid(3), tags: vec![p("/c")], content: b"C".to_vec() },
+            Change::Copy { from: eid(2), id: eid(4), tags: vec![p("/d")] },
         ];
-        // 照 run 的第 1 步做，然后“断电”。
-        let plan = unit.plan(&changes).unwrap();
-        let mut all = plan.hydrate.clone();
-        all.extend_from_slice(&changes);
-        let aux = [Aux::Put(AUX_INTENT.to_vec(), encode_intent(&plan.items))];
-        unit.image.commit_batch(&Batch { changes: &all, aux: &aux, ..Batch::default() }).unwrap();
-        if stop_after_host_ops {
-            unit.carry_out(&plan.items).unwrap();
+        // 照 run 的第 1 步做，再按阶段做一部分宿主操作，然后“断电”。
+        {
+            let inner = unit.inner.get_mut();
+            let plan = inner.plan(&changes).unwrap();
+            assert!(plan.hydrate.is_empty());
+            let aux = [Aux::Put(AUX_INTENT.to_vec(), plan.intent.encode())];
+            inner.image.commit_batch(&mut Batch { changes: &plan.changes, aux: &aux, ..Batch::default() }).unwrap();
+            if stage >= 1 {
+                inner.carry_out(&plan.intent).unwrap();
+            }
+            if stage >= 2 {
+                // 第 2 步做完以后再重做一遍，结果也一样。
+                fs::create_dir_all(inner.tmp()).unwrap();
+                inner.carry_out(&plan.intent).unwrap();
+            }
         }
         drop(unit);
 
         let (unit, report) = DirUnit::open(&root, ids()).unwrap();
-        assert_eq!(report, ScanReport::default(), "nothing left for the scan to fix");
-        assert_eq!(fs::read(root.join("b")).unwrap(), b"A");
+        assert_eq!(report, ScanReport::default(), "stage {stage}: nothing left for the scan to fix");
+        assert_eq!(fs::read(root.join("b")).unwrap(), b"A1");
         assert_eq!(fs::read(root.join("x/a")).unwrap(), b"B");
         assert_eq!(fs::read(root.join("c")).unwrap(), b"C");
+        assert_eq!(fs::read(root.join("d")).unwrap(), b"B");
         assert!(!root.join("a").exists());
         assert_eq!(image_size(&unit, &eid(3)), 0);
         assert!(unit.image().aux_get(AUX_INTENT).unwrap().is_none());
@@ -290,7 +393,7 @@ fn works_inside_a_volume() {
     use tagfs_core::{Query, Rules, Volume};
 
     let root = scratch("volume");
-    let (dir, _) = DirUnit::create(&root, UnitId([1; 16]), 64 << 20, ids()).unwrap();
+    let (dir, _) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
     let rules = Rules::<()>::new().writer("user", |_| true).modify(|_, _| true).create(|_| Some(vec![]));
     let mut v = Volume::new(rules, ids());
     v.attach(Box::new(MemUnit::new(UnitId([2; 16])))).unwrap();

@@ -48,6 +48,8 @@ const VERSION: u32 = 1;
 /// 支持的最小块大小。树的单个条目上限由它决定。
 pub const MIN_BLOCK_SIZE: u32 = 4096;
 const MIN_BLOCKS: u64 = 16;
+/// 扩容时至少加这么多块（16 MiB）。
+const GROW_MIN_BLOCKS: u64 = 4096;
 
 /// 打开或格式化失败的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,9 +154,23 @@ pub enum Aux {
 /// 一条附加记录：键和值。
 pub type AuxRecord = (Vec<u8>, Vec<u8>);
 
+/// 内容的来源，按偏移分段读取，不必整个放进内存。可能被从头再读一遍（提交因扩容重做时）。
+pub trait Source {
+    /// 从 `offset` 读到 `buf`，返回读到的字节数；0 表示结束。
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError>;
+}
+
+/// 用 `source` 的全部内容替换实体 `id` 的内容。
+pub struct Fill<'a> {
+    pub id: EntityId,
+    pub source: &'a mut dyn Source,
+}
+
 /// 一次提交的全部内容，见 [`BlockUnit::commit_batch`]。
 #[derive(Default)]
 pub struct Batch<'a> {
+    /// 先做：替换这些实体的内容。
+    pub fills: Vec<Fill<'a>>,
     /// 实体的修改，按顺序应用。
     pub changes: &'a [Change],
     /// 附加记录的改动，在修改之后应用。
@@ -394,16 +410,43 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         }
     }
 
-    fn update(&mut self, f: impl FnOnce(&mut Work<D>) -> Result<(), UnitError>) -> Result<(), UnitError> {
-        let mut w = self.work();
-        f(&mut w)?;
-        self.commit(w)
+    /// 在工作区里做改动并提交。空间不够时，设备能扩容就扩容后整个重做。
+    fn update(&mut self, mut f: impl FnMut(&mut Work<D>) -> Result<(), UnitError>) -> Result<(), UnitError> {
+        loop {
+            let mut w = self.work();
+            match f(&mut w).and_then(|()| self.commit(w)) {
+                Err(UnitError::NoSpace) if self.grow() => continue,
+                r => return r,
+            }
+        }
+    }
+
+    /// 设备扩容（至少翻倍），新增的块进空闲空间。下一次提交把新的大小写进超级块；在那之前断电，
+    /// 超级块还是旧的大小，多出来的部分没人用。返回是否扩成了。
+    fn grow(&mut self) -> bool {
+        let bs = self.bs as u64;
+        let old = self.sb.blocks;
+        let want = old.saturating_mul(2).max(old + GROW_MIN_BLOCKS);
+        let mut dev = self.dev.borrow_mut();
+        if dev.grow(want.saturating_mul(bs)).is_err() {
+            return false;
+        }
+        let now = dev.capacity() / bs;
+        if now <= old {
+            return false;
+        }
+        self.free.insert(old, now - old);
+        self.sb.blocks = now;
+        true
     }
 
     /// 把一批修改、附加记录和准备记录的了结作为一次提交原子地完成。
     /// 建在块格式单元之上的单元（如目录单元）靠它把自己的记录和实体的修改放进同一次提交。
-    pub fn commit_batch(&mut self, batch: &Batch<'_>) -> Result<(), UnitError> {
+    pub fn commit_batch(&mut self, batch: &mut Batch<'_>) -> Result<(), UnitError> {
         self.update(|w| {
+            for fill in batch.fills.iter_mut() {
+                w.fill(&fill.id, &mut *fill.source)?;
+            }
             for c in batch.changes {
                 w.apply(c)?;
             }
@@ -595,7 +638,7 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
 
     fn commit_prepared(&mut self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
         let (_, changes) = self.with_view(|v| v.prepared_one(&txn))?.ok_or(UnitError::UnknownTxn(txn))?;
-        self.commit_batch(&Batch { changes: &changes, finish: Some((txn, as_primary)), ..Batch::default() })
+        self.commit_batch(&mut Batch { changes: &changes, finish: Some((txn, as_primary)), ..Batch::default() })
     }
 
     fn abort_prepared(&mut self, txn: TxnId) -> Result<(), UnitError> {

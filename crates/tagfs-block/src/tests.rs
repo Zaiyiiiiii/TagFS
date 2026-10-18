@@ -354,15 +354,57 @@ fn aux_records_commit_together_with_changes() {
     let mut unit = fresh(128);
     let changes = [Change::Create { id: eid(1), tags: vec![], content: b"x".to_vec() }];
     let aux = [Aux::Put(b"log/1".to_vec(), b"a".to_vec()), Aux::Put(b"log/2".to_vec(), b"b".to_vec())];
-    unit.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
+    unit.commit_batch(&mut Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
     // 修改失败时附加记录也不生效。
     let bad = [Change::Delete { id: eid(9) }];
     let more = [Aux::Delete(b"log/1".to_vec())];
-    assert!(unit.commit_batch(&Batch { changes: &bad, aux: &more, ..Batch::default() }).is_err());
+    assert!(unit.commit_batch(&mut Batch { changes: &bad, aux: &more, ..Batch::default() }).is_err());
     let unit = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
     assert_eq!(unit.aux_get(b"log/1").unwrap(), Some(b"a".to_vec()));
     assert_eq!(unit.aux_list(b"log/").unwrap().len(), 2);
     assert_eq!(unit.snapshot().all().unwrap(), vec![eid(1)]);
+    unit.verify().unwrap();
+}
+
+#[test]
+fn a_growable_device_grows_instead_of_running_out() {
+    let dev = MemDevice::growable(16 * BS as u64, 64 << 20, BS);
+    let mut unit = BlockUnit::format(dev, UNIT).unwrap();
+    let mut rng = Rng(3);
+    let big = rng.bytes(3 << 20);
+    unit.apply(&[Change::Create { id: eid(1), tags: vec![], content: big.clone() }]).unwrap();
+    assert!(unit.total_blocks() > 16);
+    unit.verify().unwrap();
+    let back = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    back.verify().unwrap();
+    assert_eq!(dump(&*back.snapshot())[&eid(1)].1, big);
+    // 扩到设备上限还不够，才报空间不足。
+    let mut unit = back;
+    let huge = Change::Create { id: eid(2), tags: vec![], content: vec![1; 80 << 20] };
+    assert_eq!(unit.apply(&[huge]), Err(UnitError::NoSpace));
+    unit.verify().unwrap();
+}
+
+#[test]
+fn fill_streams_content_from_a_source() {
+    use crate::{Batch, Fill, Source};
+    struct Counting(u64);
+    impl Source for Counting {
+        fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError> {
+            let n = (self.0.saturating_sub(offset) as usize).min(buf.len());
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = ((offset as usize + i) % 253) as u8;
+            }
+            Ok(n)
+        }
+    }
+    let mut unit = fresh(2048);
+    unit.apply(&[Change::Create { id: eid(1), tags: vec![], content: b"old".to_vec() }]).unwrap();
+    let mut src = Counting(2_500_000);
+    unit.commit_batch(&mut Batch { fills: vec![Fill { id: eid(1), source: &mut src }], ..Batch::default() }).unwrap();
+    let got = &dump(&*unit.snapshot())[&eid(1)].1;
+    assert_eq!(got.len(), 2_500_000);
+    assert!(got.iter().enumerate().all(|(i, b)| *b == (i % 253) as u8));
     unit.verify().unwrap();
 }
 

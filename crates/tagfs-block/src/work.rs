@@ -20,6 +20,8 @@ use crate::view::{INLINE_MAX, Object, View, encode_prepared};
 const COPY_CHUNK_BLOCKS: u64 = 64;
 /// 准备记录切成这么大的片存进树里，每片一个条目。
 const PREPARED_CHUNK: usize = 1024;
+/// 从 [`crate::Source`] 一次读这么多。
+const FILL_CHUNK: usize = 1 << 20;
 
 pub(crate) struct Work<D: BlockDevice> {
     pub(crate) dev: Rc<RefCell<D>>,
@@ -313,6 +315,22 @@ impl<D: BlockDevice> Work<D> {
         self.unref(o)?;
         self.set_entity_object(id, copy)?;
         Ok(copy)
+    }
+
+    /// 用 `source` 的内容替换实体的内容，分段读写。
+    pub(crate) fn fill(&mut self, id: &EntityId, source: &mut dyn crate::Source) -> Result<(), UnitError> {
+        let o = self.own_object(id)?;
+        self.truncate_object(o, 0)?;
+        let mut buf = vec![0u8; FILL_CHUNK];
+        let mut offset = 0u64;
+        loop {
+            let n = source.read(offset, &mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.write_object(o, offset, &buf[..n])?;
+            offset += n as u64;
+        }
     }
 
     pub(crate) fn apply(&mut self, change: &Change) -> Result<(), UnitError> {

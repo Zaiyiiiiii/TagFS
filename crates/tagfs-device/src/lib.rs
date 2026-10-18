@@ -20,6 +20,8 @@ pub enum DeviceError {
     Io,
     /// 设备只读。
     ReadOnly,
+    /// 设备不支持这个操作（例如裸盘不能扩容）。
+    Unsupported,
 }
 
 impl core::fmt::Display for DeviceError {
@@ -28,6 +30,7 @@ impl core::fmt::Display for DeviceError {
             DeviceError::OutOfRange => "out of device range",
             DeviceError::Io => "device i/o error",
             DeviceError::ReadOnly => "device is read-only",
+            DeviceError::Unsupported => "operation not supported by the device",
         })
     }
 }
@@ -52,6 +55,13 @@ pub trait BlockDevice {
 
     /// 告诉设备这段范围不再使用。内容随后读出来是什么不作保证。
     fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError>;
+
+    /// 把容量扩到至少 `capacity` 字节，新增部分读出来是零。能扩容的设备（如宿主机上的单文件）实现它；
+    /// 默认不支持。
+    fn grow(&mut self, capacity: u64) -> Result<(), DeviceError> {
+        let _ = capacity;
+        Err(DeviceError::Unsupported)
+    }
 }
 
 /// `offset..offset+len` 是否落在容量为 `capacity` 的设备内。

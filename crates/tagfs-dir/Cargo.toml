@@ -6,6 +6,8 @@ license.workspace = true
 description = "TagFS 的目录单元：把宿主目录里按路径组织的文件映射成实体"
 
 [dependencies]
+file-id = "0.2"
+notify = "8"
 tagfs-block = { path = "../tagfs-block" }
 tagfs-core = { path = "../tagfs-core" }
 tagfs-device-host = { path = "../tagfs-device-host" }

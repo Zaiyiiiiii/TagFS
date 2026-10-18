@@ -14,14 +14,22 @@ pub struct FileDevice {
     block_size: u32,
     capacity: u64,
     read_only: bool,
+    /// 普通文件可以扩容；裸盘不行。
+    growable: bool,
 }
 
 impl FileDevice {
-    /// 新建（或截断已有的）文件作为设备，容量 `capacity` 字节。
+    /// 新建（或截断已有的）文件作为设备，初始容量 `capacity` 字节。之后可以扩容。
     pub fn create(path: impl AsRef<Path>, capacity: u64, block_size: u32) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
         file.set_len(capacity)?;
-        Ok(FileDevice { file, block_size, capacity: round_down(capacity, block_size), read_only: false })
+        Ok(FileDevice {
+            file,
+            block_size,
+            capacity: round_down(capacity, block_size),
+            read_only: false,
+            growable: true,
+        })
     }
 
     /// 打开已有的文件或裸盘。容量取它当前的大小（向下取整到块）。
@@ -29,7 +37,8 @@ impl FileDevice {
         let mut file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         // 裸盘的 metadata().len() 是 0，用 seek 到末尾取大小，对普通文件也成立。
         let len = file.seek(SeekFrom::End(0))?;
-        Ok(FileDevice { file, block_size, capacity: round_down(len, block_size), read_only })
+        let growable = !read_only && file.metadata()?.is_file();
+        Ok(FileDevice { file, block_size, capacity: round_down(len, block_size), read_only, growable })
     }
 }
 
@@ -122,6 +131,19 @@ impl BlockDevice for FileDevice {
         }
         Ok(())
     }
+
+    fn grow(&mut self, capacity: u64) -> Result<(), DeviceError> {
+        if !self.growable {
+            return Err(DeviceError::Unsupported);
+        }
+        let capacity = round_down(capacity, self.block_size);
+        if capacity > self.capacity {
+            // 文件变长，新增部分是空洞：不占空间，读出来是零。
+            self.file.set_len(capacity).map_err(io_err)?;
+            self.capacity = capacity;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +170,16 @@ mod tests {
         let mut ro = dev;
         assert_eq!(ro.write_at(0, b"x"), Err(DeviceError::ReadOnly));
         assert_eq!(ro.read_at(64 * 1024 - 1, &mut [0u8; 2]), Err(DeviceError::OutOfRange));
+        assert_eq!(ro.grow(1 << 20), Err(DeviceError::Unsupported));
+        drop(ro);
+
+        let mut dev = FileDevice::open(&path, 4096, false).unwrap();
+        dev.grow(1 << 20).unwrap();
+        assert_eq!(dev.capacity(), 1 << 20);
+        dev.write_at((1 << 20) - 1, b"z").unwrap();
+        let mut buf = [1u8; 2];
+        dev.read_at(64 * 1024, &mut buf).unwrap();
+        assert_eq!(buf, [0, 0]);
         std::fs::remove_file(path).unwrap();
     }
 }

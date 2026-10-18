@@ -43,6 +43,11 @@ impl HostPath {
         HostPath::parse(&value).ok()
     }
 
+    /// 各段。
+    pub fn segments(&self) -> &[String] {
+        &self.0
+    }
+
     pub fn value(&self) -> String {
         let mut s = String::new();
         for p in &self.0 {

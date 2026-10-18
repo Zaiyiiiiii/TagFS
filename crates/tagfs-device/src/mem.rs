@@ -16,12 +16,19 @@ pub struct MemDevice {
     pending: Vec<(u64, Vec<u8>)>,
     /// 设备生命周期内一共发生过的写入次数（含已刷盘的），故障注入用它定位断电点。
     writes: u64,
+    /// 能扩容到的最大容量；`None` 表示不能扩容。
+    max_len: Option<u64>,
 }
 
 impl MemDevice {
     pub fn new(len: u64, block_size: u32) -> Self {
         assert!(block_size > 0, "block size must be positive");
-        Self { block_size, durable: vec![0; len as usize], pending: Vec::new(), writes: 0 }
+        Self { block_size, durable: vec![0; len as usize], pending: Vec::new(), writes: 0, max_len: None }
+    }
+
+    /// 能扩容的内存设备，最大到 `max_len` 字节。
+    pub fn growable(len: u64, max_len: u64, block_size: u32) -> Self {
+        Self { max_len: Some(max_len), ..Self::new(len, block_size) }
     }
 
     /// 至今发生过的写入次数。
@@ -41,7 +48,7 @@ impl MemDevice {
             let start = *offset as usize;
             durable[start..start + data.len()].copy_from_slice(data);
         }
-        MemDevice { block_size: self.block_size, durable, pending: Vec::new(), writes: 0 }
+        MemDevice { block_size: self.block_size, durable, pending: Vec::new(), writes: 0, max_len: self.max_len }
     }
 }
 
@@ -95,6 +102,17 @@ impl BlockDevice for MemDevice {
     fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError> {
         if !in_range(self.capacity(), offset, len as usize) {
             return Err(DeviceError::OutOfRange);
+        }
+        Ok(())
+    }
+
+    fn grow(&mut self, capacity: u64) -> Result<(), DeviceError> {
+        let max = self.max_len.ok_or(DeviceError::Unsupported)?;
+        if capacity > max {
+            return Err(DeviceError::OutOfRange);
+        }
+        if capacity > self.capacity() {
+            self.durable.resize(capacity as usize, 0);
         }
         Ok(())
     }
