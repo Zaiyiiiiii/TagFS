@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "tagfs-core"
+version = "0.1.0"
+
+[[package]]
 name = "tagfs-device"
 version = "0.1.0"

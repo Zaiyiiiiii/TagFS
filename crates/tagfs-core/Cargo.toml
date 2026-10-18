@@ -1,0 +1,9 @@
+[package]
+name = "tagfs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的逻辑层：实体、Tag、可见性、查询、卷与事务"
+
+[lints]
+workspace = true
