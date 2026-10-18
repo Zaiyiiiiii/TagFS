@@ -38,6 +38,8 @@ pub enum Error {
     NoUnit,
     /// 跨单元复制的源实体是本事务里新建、尚未提交的。
     Uncommitted,
+    /// Tag 的命名空间、键或字符串值超过长度上限。
+    TagTooLong,
     Unit(UnitError),
 }
 
@@ -55,6 +57,7 @@ impl fmt::Display for Error {
             Error::Pending => f.write_str("entity is part of an unfinished transaction"),
             Error::NoUnit => f.write_str("storage unit not online"),
             Error::Uncommitted => f.write_str("source entity is not committed yet"),
+            Error::TagTooLong => f.write_str("tag exceeds the length limits"),
             Error::Unit(e) => write!(f, "{e}"),
         }
     }
@@ -315,6 +318,9 @@ impl<P: Policy> Txn<'_, P> {
     }
 
     fn check_tag_writable(&self, tag: &Tag) -> Result<(), Error> {
+        if !tag.within_limits() {
+            return Err(Error::TagTooLong);
+        }
         if tag.ns.is_tagfs() || !self.vol.policy.can_write(self.ctx, &tag.ns) {
             return Err(Error::NotWritable);
         }
@@ -336,6 +342,9 @@ impl<P: Policy> Txn<'_, P> {
         let mut extra = self.vol.policy.on_create(self.ctx).ok_or(Error::NotWritable)?;
         if extra.iter().any(|t| t.ns.is_tagfs()) {
             return Err(Error::NotWritable);
+        }
+        if !extra.iter().all(Tag::within_limits) {
+            return Err(Error::TagTooLong);
         }
         extra.extend(tags);
         Ok(crate::mem_unit::normalized(&extra))

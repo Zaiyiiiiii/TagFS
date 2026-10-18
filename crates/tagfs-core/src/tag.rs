@@ -126,6 +126,25 @@ impl fmt::Debug for Tag {
     }
 }
 
+/// 命名空间名的最大长度（字节）。
+pub const MAX_NAMESPACE_LEN: usize = 64;
+/// 键的最大长度（字节）。
+pub const MAX_KEY_LEN: usize = 64;
+/// 字符串值的最大长度（字节）。
+pub const MAX_STR_LEN: usize = 255;
+
+impl Tag {
+    /// 长度是否在限制之内。存储单元要把 Tag 放进索引键，键的长度必须有上限。
+    pub fn within_limits(&self) -> bool {
+        self.ns.as_str().len() <= MAX_NAMESPACE_LEN
+            && self.key.as_str().len() <= MAX_KEY_LEN
+            && match &self.value {
+                Value::Str(s) => s.len() <= MAX_STR_LEN,
+                _ => true,
+            }
+    }
+}
+
 /// TagFS 自己写入的 Tag 的键。
 pub mod tagfs_keys {
     /// 跨单元事务尚未在所有参与单元完成，值为事务编号。带它的实体在结果确定前只读。
