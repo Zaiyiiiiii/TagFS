@@ -1,12 +1,17 @@
 [package]
-name = "tagfs-dir"
+name = "tagfs-backend-hostdir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TagFS 的目录单元：把宿主目录里按路径组织的文件映射成实体"
+description = "TagFS 的宿主目录后端（路径目录兼容层）：把宿主目录里按路径组织的文件映射成实体"
+
+[[bin]]
+name = "tagfs-hostdir"
+path = "src/bin/tagfs-hostdir.rs"
 
 [dependencies]
 file-id = "0.2"
+getrandom = "0.3"
 notify = "8"
 tagfs-block = { path = "../tagfs-block" }
 tagfs-core = { path = "../tagfs-core" }

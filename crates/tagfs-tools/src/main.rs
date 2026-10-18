@@ -15,10 +15,9 @@ const USAGE: &str = "\
 <单元> 是单文件单元（镜像文件或裸盘）或目录单元的目录。
 
   mkimage <文件>                 新建单文件单元
-  mkdir <目录>                   在已有目录上建目录单元，把里面的文件映射进来
   info <单元>                    单元信息
   check <单元>                   一致性检查（目录单元同时和目录对账）
-  ls <单元> [条件...]            列出满足条件的实体：ID、长度、Tag
+  find <单元> [条件...]          查找满足条件的实体，列出 ID、长度、Tag
   show <单元> <ID>               实体的 Tag 和长度
   cat <单元> <ID>                实体内容写到标准输出
   put <单元> <文件|-> [Tag...]   新建实体，内容取自文件（- 为标准输入），返回 ID
@@ -28,7 +27,8 @@ const USAGE: &str = "\
 
 Tag：ns:key（无值）、ns:key=文本、ns:key=#123（uint）。
 条件：ns:key（带这个键）、ns:key=值、ns:key^=前缀、ns:key>=值（还有 > <= <），前加 ! 取反，多个条件取“且”。
-目录单元里 tagfs:hostfs_path=/路径 就是文件在目录里的位置，增删改它就是建、删、移动文件。";
+目录单元由宿主目录后端的工具 tagfs-hostdir 建立；在目录单元里，tagfs:hostfs_path=/路径 就是文件在目录里的位置，
+增删改它就是建、删、移动文件。";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -103,14 +103,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let unit = tagfs::create_image(path, tagfs::new_unit_id()).map_err(err)?;
             println!("unit {}", hex(&unit.id().0));
         }
-        "mkdir" => {
-            let (unit, report) = DirUnit::create(path, tagfs::new_unit_id(), Box::new(SystemIds)).map_err(err)?;
-            println!("unit {}", hex(&unit.id().0));
-            println!("mapped {} files, skipped {}", report.added, report.skipped);
-        }
         "info" => info(path)?,
         "check" => check(path)?,
-        "ls" => {
+        "find" => {
             let vol = volume(path)?;
             let query = syntax::query(rest)?;
             let mut cursor = tagfs::Cursor::new(query, 1000);

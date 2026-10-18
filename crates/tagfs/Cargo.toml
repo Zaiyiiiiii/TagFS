@@ -11,7 +11,7 @@ tagfs-block = { path = "../tagfs-block" }
 tagfs-core = { path = "../tagfs-core" }
 tagfs-device = { path = "../tagfs-device" }
 tagfs-device-host = { path = "../tagfs-device-host" }
-tagfs-dir = { path = "../tagfs-dir" }
+tagfs-backend-hostdir = { path = "../tagfs-backend-hostdir" }
 
 [lints]
 workspace = true

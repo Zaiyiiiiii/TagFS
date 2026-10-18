@@ -25,6 +25,7 @@
 use std::io;
 use std::path::Path;
 
+pub use tagfs_backend_hostdir::{DirError, DirUnit, HostPath, ScanReport};
 pub use tagfs_block::{BlockUnit, OpenError};
 pub use tagfs_core::tag::tagfs_keys;
 pub use tagfs_core::{
@@ -33,7 +34,6 @@ pub use tagfs_core::{
 };
 pub use tagfs_device::{BlockDevice, DeviceError, MemDevice};
 pub use tagfs_device_host::FileDevice;
-pub use tagfs_dir::{DirError, DirUnit, HostPath, ScanReport};
 
 /// 块大小。
 pub const BLOCK_SIZE: u32 = 4096;

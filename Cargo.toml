@@ -6,7 +6,7 @@ members = [
     "crates/tagfs-core",
     "crates/tagfs-device",
     "crates/tagfs-device-host",
-    "crates/tagfs-dir",
+    "crates/tagfs-backend-hostdir",
     "crates/tagfs-tools",
 ]
 
