@@ -1,11 +1,7 @@
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
-use alloc::vec;
-use alloc::vec::Vec;
+//! 卷的行为，用内存后端做存储单元。
 
-use super::*;
-use crate::mem_unit::MemUnit;
-use crate::policy::Rules;
+use tagfs_backend_mem::MemUnit;
+use tagfs_core::*;
 
 /// 测试用的调用上下文：当前用户、当前应用、是否有“读取所有用户文件”的能力，
 /// 以及这次创建的实体是否应用专属（操作系统据此附加 owner_app 边界）。
@@ -186,19 +182,25 @@ fn queries_can_be_read_page_by_page() {
 }
 
 #[test]
-fn mapped_tagfs_keys_follow_the_modify_rule() {
-    let mut v = volume(&[1]);
-    let a = create(&mut v, &ALICE, None, vec![], b"");
-    let path = Tag::new("tagfs", "hostfs_path", "/a.txt");
+fn keys_a_unit_maps_follow_the_modify_rule() {
+    let mut v = Volume::new(rules(), Box::new(Counter(0)));
+    v.attach(Box::new(MemUnit::new(uid(1)).mapping(&["where"]))).unwrap();
+    v.attach(Box::new(MemUnit::new(uid(2)))).unwrap();
+    let a = create(&mut v, &ALICE, Some(1), vec![], b"");
+    let b = create(&mut v, &ALICE, Some(2), vec![], b"");
+    let place = Tag::new("tagfs", "where", "/a.txt");
     let mut tx = v.begin(&BOB);
-    assert_eq!(tx.add_tag(&a, path.clone()), Err(Error::NotFound), "invisible to bob");
+    assert_eq!(tx.add_tag(&a, place.clone()), Err(Error::NotFound), "invisible to bob");
     drop(tx);
     let mut tx = v.begin(&ADMIN_IN_PLAYER);
-    assert_eq!(tx.add_tag(&a, path.clone()), Err(Error::NotWritable), "visible but not his");
+    assert_eq!(tx.add_tag(&a, place.clone()), Err(Error::NotWritable), "visible but not his");
     drop(tx);
     let mut tx = v.begin(&ALICE);
-    assert!(tx.add_tag(&a, path.clone()).is_ok());
-    assert!(tx.create(None, vec![Tag::new("tagfs", "hostfs_path", "/b.txt")], vec![]).is_ok());
+    assert!(tx.add_tag(&a, place.clone()).is_ok());
+    assert!(tx.create(Some(uid(1)), vec![place.clone()], vec![]).is_ok());
+    // 单元 2 不映射这个键：它和别的 tagfs 键一样，谁都不能写。
+    assert_eq!(tx.add_tag(&b, place.clone()), Err(Error::NotWritable));
+    assert_eq!(tx.create(Some(uid(2)), vec![place], vec![]), Err(Error::NotWritable));
 }
 
 #[test]
@@ -307,7 +309,7 @@ fn half_done(primary_committed: bool) -> (MemUnit, MemUnit, EntityId, EntityId, 
     two.apply(&[Change::Create { id: e, tags: vec![owner.clone(), name("e")], content: vec![] }]).unwrap();
 
     let txn = TxnId([0x77; 16]);
-    let pending = pending_tag(txn);
+    let pending = Tag::new("tagfs", "txn_pending", txn.to_string());
     let info = TxnInfo { id: txn, primary: uid(1), participants: vec![uid(1), uid(2)] };
     let x = EntityId([0x10; 16]);
     let y = EntityId([0x20; 16]);

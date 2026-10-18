@@ -155,11 +155,23 @@ name = "tagfs"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "tagfs-backend-disk",
  "tagfs-backend-file",
  "tagfs-backend-hostdir",
+ "tagfs-backend-mem",
  "tagfs-block",
  "tagfs-core",
  "tagfs-device",
+ "tagfs-device-host",
+]
+
+[[package]]
+name = "tagfs-backend-disk"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "tagfs-block",
+ "tagfs-core",
  "tagfs-device-host",
 ]
 
@@ -181,7 +193,15 @@ dependencies = [
  "getrandom",
  "notify",
  "tagfs-backend-file",
+ "tagfs-backend-mem",
  "tagfs-block",
+ "tagfs-core",
+]
+
+[[package]]
+name = "tagfs-backend-mem"
+version = "0.1.0"
+dependencies = [
  "tagfs-core",
 ]
 
@@ -189,6 +209,7 @@ dependencies = [
 name = "tagfs-block"
 version = "0.1.0"
 dependencies = [
+ "tagfs-backend-mem",
  "tagfs-core",
  "tagfs-device",
 ]

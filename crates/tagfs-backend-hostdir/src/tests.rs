@@ -240,26 +240,26 @@ fn bad_or_taken_paths_change_nothing() {
         ])
     };
     for bad in ["/../x", "/a/../../x", "relative", "/.tagfs/unit.img", "/a//b", "/a/"] {
-        assert_eq!(try_path(&mut unit, bad), Err(UnitError::InvalidPath), "{bad}");
+        assert_eq!(try_path(&mut unit, bad), Err(INVALID_PATH), "{bad}");
     }
-    assert_eq!(try_path(&mut unit, "/outside-tagfs.txt"), Err(UnitError::PathTaken));
-    assert_eq!(try_path(&mut unit, "/file/below"), Err(UnitError::PathTaken));
+    assert_eq!(try_path(&mut unit, "/outside-tagfs.txt"), Err(PATH_TAKEN));
+    assert_eq!(try_path(&mut unit, "/file/below"), Err(PATH_TAKEN));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(std::env::temp_dir(), root.join("link")).unwrap();
-        assert_eq!(try_path(&mut unit, "/link/x"), Err(UnitError::InvalidPath));
+        assert_eq!(try_path(&mut unit, "/link/x"), Err(INVALID_PATH));
     }
     // 一个实体两个路径，两个实体同一路径。
     assert_eq!(
         unit.apply(&[Change::Create { id: eid(52), tags: vec![p("/m"), p("/n")], content: vec![] }]),
-        Err(UnitError::InvalidPath)
+        Err(INVALID_PATH)
     );
     assert_eq!(
         unit.apply(&[
             Change::Create { id: eid(53), tags: vec![p("/same")], content: vec![] },
             Change::Create { id: eid(54), tags: vec![p("/same")], content: vec![] },
         ]),
-        Err(UnitError::PathTaken)
+        Err(PATH_TAKEN)
     );
     // 删掉之后再写，和别的单元一样报“不存在”。
     let file = by_path(&unit, "/file").unwrap();
@@ -389,7 +389,7 @@ fn an_interrupted_change_is_finished_when_reopened() {
 
 #[test]
 fn works_inside_a_volume() {
-    use tagfs_core::mem_unit::MemUnit;
+    use tagfs_backend_mem::MemUnit;
     use tagfs_core::{Query, Rules, Volume};
 
     let root = scratch("volume");

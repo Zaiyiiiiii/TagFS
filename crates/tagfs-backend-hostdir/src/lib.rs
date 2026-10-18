@@ -32,13 +32,18 @@ use std::sync::mpsc;
 
 use tagfs_backend_file::{ImageError, ImageUnit};
 use tagfs_block::{Aux, Batch, Fill, OpenError, Source};
-use tagfs_core::tag::tagfs_keys::HOSTFS_PATH;
 use tagfs_core::{
     Change, EntityId, EntityRecord, IdSource, Key, Namespace, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError,
     UnitId, Value,
 };
 
-pub use path::{HostPath, RESERVED};
+pub use path::{HostPath, INVALID_PATH, PATH_TAKEN, RESERVED};
+
+/// 目录单元映射的 `tagfs` 键：宿主层级文件系统（Windows、Linux 这一类按目录树组织的文件系统）里的路径。
+///
+/// 值是以挂载目录为根的路径，如 `/abc/bcd/1.file`，实体的内容就是那个文件。这个 Tag 不是存下来的，
+/// 而是映射出来的：增、删、改它，就是在宿主上建立、删除、移动对应的文件。
+pub const HOSTFS_PATH: &str = "hostfs_path";
 
 const IMAGE: &str = "unit.img";
 const TMP: &str = "tmp";
@@ -124,9 +129,9 @@ fn path_of(tags: &[Tag]) -> Result<Option<HostPath>, UnitError> {
     let (ns, key) = hostfs_key();
     let mut found = None;
     for t in tags.iter().filter(|t| t.is(&ns, &key)) {
-        let Value::Str(v) = &t.value else { return Err(UnitError::InvalidPath) };
+        let Value::Str(v) = &t.value else { return Err(INVALID_PATH) };
         if found.replace(HostPath::parse(v)?).is_some() {
-            return Err(UnitError::InvalidPath);
+            return Err(INVALID_PATH);
         }
     }
     Ok(found)
@@ -929,7 +934,7 @@ impl Inner {
             if let Some(p) = &new
                 && !targets.insert(p.clone())
             {
-                return Err(UnitError::PathTaken);
+                return Err(PATH_TAKEN);
             }
             let place = match &new {
                 None => Place::Nothing,
@@ -957,7 +962,7 @@ impl Inner {
                 && p.inspect(&self.root)?.is_some()
                 && !vacated.contains(p)
             {
-                return Err(UnitError::PathTaken);
+                return Err(PATH_TAKEN);
             }
         }
         let hydrate = hydrate_set.into_iter().map(|id| (id, before[&id].clone().expect("on host"))).collect();
@@ -1153,6 +1158,10 @@ fn walk(
 impl Unit for DirUnit {
     fn id(&self) -> UnitId {
         self.inner.borrow().image.id()
+    }
+
+    fn mapped_keys(&self) -> &[&'static str] {
+        &[HOSTFS_PATH]
     }
 
     fn snapshot(&self) -> Box<dyn Snapshot> {

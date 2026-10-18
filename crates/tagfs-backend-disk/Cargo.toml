@@ -1,0 +1,19 @@
+[package]
+name = "tagfs-backend-disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的裸盘后端：块格式单元直接放在整块盘或分区上"
+
+[[bin]]
+name = "tagfs-disk"
+path = "src/bin/tagfs-disk.rs"
+
+[dependencies]
+getrandom = "0.3"
+tagfs-block = { path = "../tagfs-block" }
+tagfs-core = { path = "../tagfs-core" }
+tagfs-device-host = { path = "../tagfs-device-host" }
+
+[lints]
+workspace = true

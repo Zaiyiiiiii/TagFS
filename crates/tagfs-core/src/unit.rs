@@ -1,7 +1,7 @@
 //! 存储单元接口。
 //!
-//! 一个单元（一块盘、一个宿主机文件、一个宿主机目录……）只管自己的实体、Tag、对象和索引，
-//! 不保存其他单元的任何数据。实体和它引用的对象总在同一个单元。卷由若干单元组成，
+//! 一个单元只管自己的实体、Tag、对象和索引，不保存其他单元的任何数据。单元由各后端实现，
+//! 逻辑层不知道有哪些后端。实体和它引用的对象总在同一个单元。卷由若干单元组成，
 //! 单元离线时它的实体一起从卷里消失。
 //!
 //! 单元不做可见性和权限判断，那是卷的事；单元只保证自己的数据一致：一次 [`Unit::apply`]
@@ -106,11 +106,8 @@ pub enum UnitError {
     Device,
     /// 没有这个事务的准备记录。
     UnknownTxn(TxnId),
-    /// 映射路径不合法：格式不对、越出挂载目录、经过符号链接、在宿主上不能用作文件名，
-    /// 或者一个实体带了不止一个路径。
-    InvalidPath,
-    /// 映射路径在宿主上已经被别的文件占用（或者路径上某一级是文件）。
-    PathTaken,
+    /// 单元按自己的规则拒绝了这组修改（例如映射的 Tag 取值不合法）。原因由单元给出。
+    Rejected(&'static str),
 }
 
 impl fmt::Display for UnitError {
@@ -122,8 +119,7 @@ impl fmt::Display for UnitError {
             UnitError::Corrupt => f.write_str("unit data is corrupt"),
             UnitError::Device => f.write_str("device error"),
             UnitError::UnknownTxn(t) => write!(f, "no prepared transaction {t}"),
-            UnitError::InvalidPath => f.write_str("invalid host path"),
-            UnitError::PathTaken => f.write_str("host path already taken"),
+            UnitError::Rejected(why) => write!(f, "rejected by the unit: {why}"),
         }
     }
 }
@@ -132,6 +128,12 @@ impl core::error::Error for UnitError {}
 
 pub trait Unit {
     fn id(&self) -> UnitId;
+
+    /// 这个单元映射的 `tagfs` 键：它们反映单元里的实际状态（例如实体对应的宿主文件），
+    /// 上层写它就是让单元去改那个状态，所以卷按“修改实体”授权上层写它们。其余 `tagfs` 键只有逻辑层自己写。
+    fn mapped_keys(&self) -> &[&'static str] {
+        &[]
+    }
 
     /// 当前已提交状态的只读快照。之后的提交不影响它。
     fn snapshot(&self) -> Box<dyn Snapshot>;

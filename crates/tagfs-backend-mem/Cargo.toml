@@ -1,0 +1,12 @@
+[package]
+name = "tagfs-backend-mem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的内存后端：不持久化的存储单元，也是存储单元语义的参考实现"
+
+[dependencies]
+tagfs-core = { path = "../tagfs-core" }
+
+[lints]
+workspace = true

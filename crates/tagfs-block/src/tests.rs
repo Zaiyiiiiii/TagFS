@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
-use tagfs_core::mem_unit::MemUnit;
+use tagfs_backend_mem::MemUnit;
 use tagfs_core::{
     Change, EntityId, Key, Namespace, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError, UnitId, Value,
 };

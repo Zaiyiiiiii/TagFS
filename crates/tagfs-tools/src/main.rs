@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use tagfs::{DirUnit, EntityId, ImageUnit, Query, SystemIds, Tag, Unit, Unrestricted, Volume, tagfs_keys};
+use tagfs::{DirUnit, EntityId, ImageUnit, Query, SystemIds, Tag, Unit, Unrestricted, Volume};
 
 const USAGE: &str = "\
 用法：tagfs <命令> <单元> [参数...]
@@ -229,7 +229,7 @@ fn print_image(image: &ImageUnit) -> Result<(), String> {
 }
 
 fn info(path: &str) -> Result<(), String> {
-    let has_path = Query::has("tagfs", tagfs_keys::HOSTFS_PATH);
+    let has_path = Query::has("tagfs", tagfs::hostdir::HOSTFS_PATH);
     match open(path)? {
         Opened::Image(unit) => {
             say!("kind        single-file unit");

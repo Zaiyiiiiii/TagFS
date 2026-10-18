@@ -15,22 +15,25 @@
 //! assert_eq!(vol.query(&(), &Query::is("user", "name", "hello.txt")).unwrap(), vec![id]);
 //! ```
 //!
-//! 存储单元的种类：
+//! 存储单元由各后端提供，逻辑层不知道有哪些后端：
 //!
-//! - 单文件（镜像文件）：[`image`]（单文件后端）。放在宿主能访问的任何地方，按需扩容。
-//! - 裸盘：[`open_disk`]，先用 [`format_disk`] 格式化。
-//! - 宿主目录：[`DirUnit`]（宿主目录后端，路径目录兼容层），把宿主目录里按路径组织的文件映射成实体。
-//! - 内存：[`memory_unit`]，测试和临时卷用。
+//! - [`image`]：单文件后端。单元存在一个镜像文件里，放在宿主能访问的任何地方，按需扩容。
+//! - [`disk`]：裸盘后端。单元直接放在整块盘或分区上。
+//! - [`hostdir`]：宿主目录后端（路径目录兼容层），把宿主目录里按路径组织的文件映射成实体。
+//! - [`mem`]：内存后端，不持久化。
 
 use std::io;
 use std::path::Path;
 
-/// 单文件后端。
+pub use tagfs_backend_disk as disk;
+pub use tagfs_backend_disk::DiskUnit;
 pub use tagfs_backend_file as image;
 pub use tagfs_backend_file::{ImageError, ImageUnit};
-pub use tagfs_backend_hostdir::{DirError, DirUnit, HostPath, ScanReport};
+pub use tagfs_backend_hostdir as hostdir;
+pub use tagfs_backend_hostdir::{DirError, DirUnit};
+pub use tagfs_backend_mem as mem;
+pub use tagfs_backend_mem::MemUnit;
 pub use tagfs_block::{BlockUnit, OpenError};
-pub use tagfs_core::tag::tagfs_keys;
 pub use tagfs_core::{
     Change, Entity, EntityId, EntityRecord, Error, IdSource, Key, Namespace, Policy, Probe, Query, Rules, Snapshot,
     Tag, Txn, TxnId, TxnInfo, Unit, UnitError, UnitId, Value, Volume,
@@ -47,6 +50,15 @@ pub enum UnitOpenError {
     Io(io::Error),
     Block(OpenError),
     Dir(DirError),
+}
+
+impl From<disk::DiskError> for UnitOpenError {
+    fn from(e: disk::DiskError) -> Self {
+        match e {
+            disk::DiskError::Io(e) => UnitOpenError::Io(e),
+            disk::DiskError::Format(e) => UnitOpenError::Block(e),
+        }
+    }
 }
 
 impl From<ImageError> for UnitOpenError {
@@ -108,30 +120,17 @@ pub fn new_unit_id() -> UnitId {
     UnitId(b)
 }
 
-/// 格式化裸盘（整块盘或分区），原有内容全部丢失。
-pub fn format_disk(path: impl AsRef<Path>, unit: UnitId) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
-    Ok(BlockUnit::format(FileDevice::open(path, BLOCK_SIZE, false)?, unit)?)
-}
-
-/// 打开裸盘上的单元。
-pub fn open_disk(path: impl AsRef<Path>) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
-    Ok(BlockUnit::open(FileDevice::open(path, BLOCK_SIZE, false)?)?)
-}
-
-/// 内存单元，最大 `max_bytes` 字节，按需增长。
-pub fn memory_unit(unit: UnitId, max_bytes: u64) -> BlockUnit<MemDevice> {
-    let dev = MemDevice::growable(64 * BLOCK_SIZE as u64, max_bytes, BLOCK_SIZE);
-    BlockUnit::format(dev, unit).expect("a fresh memory device formats")
-}
-
-/// 打开 `path` 上已有的单元：目录按目录单元打开，文件或设备按块格式打开。
+/// 打开 `path` 上已有的单元：目录按宿主目录单元打开，文件按单文件单元打开，设备按裸盘单元打开。
 pub fn open_unit(path: impl AsRef<Path>) -> Result<Box<dyn Unit>, UnitOpenError> {
     let path = path.as_ref();
-    if std::fs::metadata(path)?.is_dir() {
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
         let (unit, _) = DirUnit::open(path, Box::new(SystemIds))?;
         Ok(Box::new(unit))
-    } else {
+    } else if meta.is_file() {
         Ok(Box::new(image::open(path)?))
+    } else {
+        Ok(Box::new(disk::open(path)?))
     }
 }
 
@@ -219,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_cursor_walks_all_results() {
-        let mut v = volume_with(Box::new(memory_unit(new_unit_id(), 64 << 20)));
+        let mut v = volume_with(Box::new(MemUnit::new(new_unit_id())));
         let mut tx = v.begin(&());
         let mut ids: Vec<_> =
             (0..10u64).map(|i| tx.create(None, vec![Tag::new("u", "n", i)], vec![]).unwrap()).collect();

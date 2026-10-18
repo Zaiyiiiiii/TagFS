@@ -1,15 +1,19 @@
-//! 内存参考单元：不持久化，用来测试逻辑层，也是存储单元语义的参考实现。
-//! 块格式单元的行为必须和它一致。
+//! 内存后端：不持久化的存储单元。
+//!
+//! 它也是存储单元语义的参考实现：别的后端的行为（修改的效果、出错的条件、复制后的共享）都应当和它一致，
+//! 各后端的测试拿它做对照。
+
+#![no_std]
+
+extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::id::{EntityId, TxnId};
-use crate::query::Probe;
-use crate::tag::Tag;
-use crate::unit::{Change, EntityRecord, Snapshot, TxnInfo, Unit, UnitError, UnitId};
+use tagfs_core::tag::normalized;
+use tagfs_core::{Change, EntityId, EntityRecord, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError, UnitId};
 
 #[derive(Clone, Default)]
 struct State {
@@ -25,11 +29,19 @@ struct State {
 pub struct MemUnit {
     id: UnitId,
     state: Arc<State>,
+    mapped: &'static [&'static str],
 }
 
 impl MemUnit {
     pub fn new(id: UnitId) -> Self {
-        MemUnit { id, state: Arc::new(State::default()) }
+        MemUnit { id, state: Arc::new(State::default()), mapped: &[] }
+    }
+
+    /// 声明映射的 `tagfs` 键（见 [`Unit::mapped_keys`]）。内存单元里它们只是普通的 Tag，
+    /// 用来测试卷对映射键的处理。
+    pub fn mapping(mut self, keys: &'static [&'static str]) -> Self {
+        self.mapped = keys;
+        self
     }
 
     /// 当前对象个数（测试回收用）。
@@ -133,17 +145,13 @@ impl State {
     }
 }
 
-/// 排序去重后的 Tag。
-pub fn normalized(tags: &[Tag]) -> Vec<Tag> {
-    let mut v = tags.to_vec();
-    v.sort();
-    v.dedup();
-    v
-}
-
 impl Unit for MemUnit {
     fn id(&self) -> UnitId {
         self.id
+    }
+
+    fn mapped_keys(&self) -> &[&'static str] {
+        self.mapped
     }
 
     fn snapshot(&self) -> Box<dyn Snapshot> {

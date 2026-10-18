@@ -16,6 +16,12 @@ use tagfs_core::tag::MAX_STR_LEN;
 /// 挂载目录下由目录单元自己使用的目录名。
 pub const RESERVED: &str = ".tagfs";
 
+/// 映射路径不合法：格式不对、越出挂载目录、经过符号链接、在宿主上不能用作文件名，
+/// 或者一个实体带了不止一个路径。
+pub const INVALID_PATH: UnitError = UnitError::Rejected("invalid host path");
+/// 映射路径在宿主上已经被别的文件占用（或者路径上某一级是文件）。
+pub const PATH_TAKEN: UnitError = UnitError::Rejected("host path already taken");
+
 /// 校验过的映射路径，按段存放。
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HostPath(Vec<String>);
@@ -23,12 +29,12 @@ pub struct HostPath(Vec<String>);
 impl HostPath {
     pub fn parse(value: &str) -> Result<Self, UnitError> {
         if value.len() > MAX_STR_LEN {
-            return Err(UnitError::InvalidPath);
+            return Err(INVALID_PATH);
         }
-        let rest = value.strip_prefix('/').ok_or(UnitError::InvalidPath)?;
+        let rest = value.strip_prefix('/').ok_or(INVALID_PATH)?;
         let parts: Vec<String> = rest.split('/').map(String::from).collect();
         if parts.iter().any(|p| !valid_name(p)) || parts[0] == RESERVED {
-            return Err(UnitError::InvalidPath);
+            return Err(INVALID_PATH);
         }
         Ok(HostPath(parts))
     }
@@ -80,15 +86,15 @@ impl HostPath {
     pub fn inspect(&self, root: &Path) -> Result<Option<fs::Metadata>, UnitError> {
         for dir in self.parents(root) {
             match fs::symlink_metadata(&dir) {
-                Ok(m) if m.file_type().is_symlink() => return Err(UnitError::InvalidPath),
-                Ok(m) if !m.is_dir() => return Err(UnitError::PathTaken),
+                Ok(m) if m.file_type().is_symlink() => return Err(INVALID_PATH),
+                Ok(m) if !m.is_dir() => return Err(PATH_TAKEN),
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(_) => return Err(UnitError::Device),
             }
         }
         match fs::symlink_metadata(self.on_host(root)) {
-            Ok(m) if m.file_type().is_symlink() => Err(UnitError::InvalidPath),
+            Ok(m) if m.file_type().is_symlink() => Err(INVALID_PATH),
             Ok(m) => Ok(Some(m)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(UnitError::Device),
@@ -99,8 +105,8 @@ impl HostPath {
     pub fn create_parents(&self, root: &Path) -> Result<(), UnitError> {
         for dir in self.parents(root) {
             match fs::symlink_metadata(&dir) {
-                Ok(m) if m.file_type().is_symlink() => return Err(UnitError::InvalidPath),
-                Ok(m) if !m.is_dir() => return Err(UnitError::PathTaken),
+                Ok(m) if m.file_type().is_symlink() => return Err(INVALID_PATH),
+                Ok(m) if !m.is_dir() => return Err(PATH_TAKEN),
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&dir) {
                     Ok(()) => {}
@@ -165,10 +171,10 @@ mod tests {
             "/.tagfs/unit.img",
             "/.tagfs",
         ] {
-            assert_eq!(HostPath::parse(bad), Err(UnitError::InvalidPath), "{bad:?}");
+            assert_eq!(HostPath::parse(bad), Err(INVALID_PATH), "{bad:?}");
         }
         let long = format!("/{}", "a".repeat(MAX_STR_LEN));
-        assert_eq!(HostPath::parse(&long), Err(UnitError::InvalidPath));
+        assert_eq!(HostPath::parse(&long), Err(INVALID_PATH));
         assert!(HostPath::parse("/x/.tagfs").is_ok(), "only the top-level name is reserved");
     }
 }

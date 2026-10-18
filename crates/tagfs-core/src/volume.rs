@@ -372,15 +372,16 @@ impl<P: Policy> Txn<'_, P> {
         Ok((unit, r.tags))
     }
 
-    /// 能否在实体上增删这个 Tag。`entity` 是实体当前的 Tag；新建实体时为 `None`。
-    fn check_tag_writable(&self, tag: &Tag, entity: Option<&[Tag]>) -> Result<(), Error> {
+    /// 能否在 `unit` 里的实体上增删这个 Tag。`entity` 是实体当前的 Tag；新建实体时为 `None`。
+    fn check_tag_writable(&self, tag: &Tag, unit: UnitId, entity: Option<&[Tag]>) -> Result<(), Error> {
         if !tag.within_limits() {
             return Err(Error::TagTooLong);
         }
         let allowed = if tag.ns.is_tagfs() {
-            // 映射的键按修改实体授权；新建实体时，能建就能带。
-            tagfs_keys::is_mapped(tag.key.as_str())
-                && entity.is_none_or(|tags| self.vol.policy.can_modify(self.ctx, tags))
+            // 单元映射的键按修改实体授权；新建实体时，能建就能带。
+            let mapped =
+                self.vol.position(unit).is_some_and(|i| self.vol.units[i].mapped_keys().contains(&tag.key.as_str()));
+            mapped && entity.is_none_or(|tags| self.vol.policy.can_modify(self.ctx, tags))
         } else {
             self.vol.policy.can_write(self.ctx, &tag.ns)
         };
@@ -394,10 +395,10 @@ impl<P: Policy> Txn<'_, P> {
         }
     }
 
-    /// 新实体的 Tag：调用者给的（须可写）加上操作系统在创建时附加的。
-    fn creation_tags(&self, tags: Vec<Tag>) -> Result<Vec<Tag>, Error> {
+    /// 新实体（放在 `unit` 里）的 Tag：调用者给的（须可写）加上操作系统在创建时附加的。
+    fn creation_tags(&self, unit: UnitId, tags: Vec<Tag>) -> Result<Vec<Tag>, Error> {
         for t in &tags {
-            self.check_tag_writable(t, None)?;
+            self.check_tag_writable(t, unit, None)?;
         }
         let mut extra = self.vol.policy.on_create(self.ctx).ok_or(Error::NotWritable)?;
         if extra.iter().any(|t| t.ns.is_tagfs()) {
@@ -407,7 +408,7 @@ impl<P: Policy> Txn<'_, P> {
             return Err(Error::TagTooLong);
         }
         extra.extend(tags);
-        Ok(crate::mem_unit::normalized(&extra))
+        Ok(crate::tag::normalized(&extra))
     }
 
     fn push(&mut self, unit: UnitId, change: Change) {
@@ -417,7 +418,7 @@ impl<P: Policy> Txn<'_, P> {
     /// 新建实体。`unit` 为空时由卷决定放在哪个单元。
     pub fn create(&mut self, unit: Option<UnitId>, tags: Vec<Tag>, content: Vec<u8>) -> Result<EntityId, Error> {
         let unit = self.placement(unit)?;
-        let tags = self.creation_tags(tags)?;
+        let tags = self.creation_tags(unit, tags)?;
         let id = EntityId::generate(&mut *self.vol.ids);
         self.created.insert(id, (unit, tags.clone()));
         self.push(unit, Change::Create { id, tags, content });
@@ -431,7 +432,7 @@ impl<P: Policy> Txn<'_, P> {
             Some(_) => self.placement(unit)?,
             None => src_unit,
         };
-        let tags = self.creation_tags(tags)?;
+        let tags = self.creation_tags(unit, tags)?;
         let id = EntityId::generate(&mut *self.vol.ids);
         if unit == src_unit {
             self.push(unit, Change::Copy { from: *from, id, tags: tags.clone() });
@@ -481,7 +482,7 @@ impl<P: Policy> Txn<'_, P> {
 
     pub fn add_tag(&mut self, id: &EntityId, tag: Tag) -> Result<(), Error> {
         let (unit, tags) = self.target(id)?;
-        self.check_tag_writable(&tag, Some(&tags))?;
+        self.check_tag_writable(&tag, unit, Some(&tags))?;
         if let Some((_, tags)) = self.created.get_mut(id) {
             tags.push(tag.clone());
         }
@@ -491,7 +492,7 @@ impl<P: Policy> Txn<'_, P> {
 
     pub fn remove_tag(&mut self, id: &EntityId, tag: Tag) -> Result<(), Error> {
         let (unit, tags) = self.target(id)?;
-        self.check_tag_writable(&tag, Some(&tags))?;
+        self.check_tag_writable(&tag, unit, Some(&tags))?;
         if let Some((_, tags)) = self.created.get_mut(id) {
             tags.retain(|t| t != &tag);
         }
@@ -551,7 +552,7 @@ fn commit_across<P: Policy>(vol: &mut Volume<P>, changes: BTreeMap<UnitId, Vec<C
             match c {
                 Change::Create { id, tags, .. } | Change::Copy { id, tags, .. } => {
                     tags.push(tag.clone());
-                    *tags = crate::mem_unit::normalized(tags);
+                    *tags = crate::tag::normalized(tags);
                     born.insert(*id);
                 }
                 Change::Delete { id } => {
@@ -594,6 +595,3 @@ fn commit_across<P: Policy>(vol: &mut Volume<P>, changes: BTreeMap<UnitId, Vec<C
     let _ = vol.resolve();
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

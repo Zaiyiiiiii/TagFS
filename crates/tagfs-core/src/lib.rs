@@ -1,14 +1,12 @@
 //! TagFS 的逻辑层：实体、Tag、可见性、查询，以及由存储单元组成的卷和它上面的事务。
 //!
-//! 这里不碰任何存储格式。存储单元通过 [`unit::Unit`] 接入；块格式单元在 `tagfs-block`，
-//! 宿主机目录单元（路径目录兼容层）在 `tagfs-backend-hostdir`。
+//! 这里不碰任何存储：存储单元由各后端实现 [`unit::Unit`] 接入，逻辑层不知道有哪些后端。
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod id;
-pub mod mem_unit;
 pub mod policy;
 pub mod query;
 pub mod tag;
