@@ -348,6 +348,24 @@ fn prepared_transactions_survive_a_restart() {
     unit.verify().unwrap();
 }
 
+#[test]
+fn aux_records_commit_together_with_changes() {
+    use crate::{Aux, Batch};
+    let mut unit = fresh(128);
+    let changes = [Change::Create { id: eid(1), tags: vec![], content: b"x".to_vec() }];
+    let aux = [Aux::Put(b"log/1".to_vec(), b"a".to_vec()), Aux::Put(b"log/2".to_vec(), b"b".to_vec())];
+    unit.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
+    // 修改失败时附加记录也不生效。
+    let bad = [Change::Delete { id: eid(9) }];
+    let more = [Aux::Delete(b"log/1".to_vec())];
+    assert!(unit.commit_batch(&Batch { changes: &bad, aux: &more, ..Batch::default() }).is_err());
+    let unit = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    assert_eq!(unit.aux_get(b"log/1").unwrap(), Some(b"a".to_vec()));
+    assert_eq!(unit.aux_list(b"log/").unwrap().len(), 2);
+    assert_eq!(unit.snapshot().all().unwrap(), vec![eid(1)]);
+    unit.verify().unwrap();
+}
+
 /// 写到第 `budget` 次就“断电”的设备：之后的写入和刷盘都失败。
 struct Budget {
     inner: MemDevice,

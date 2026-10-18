@@ -142,6 +142,22 @@ fn namespace_write_rules_default_to_deny() {
 }
 
 #[test]
+fn mapped_tagfs_keys_follow_the_modify_rule() {
+    let mut v = volume(&[1]);
+    let a = create(&mut v, &ALICE, None, vec![], b"");
+    let path = Tag::new("tagfs", "hostfs_path", "/a.txt");
+    let mut tx = v.begin(&BOB);
+    assert_eq!(tx.add_tag(&a, path.clone()), Err(Error::NotFound), "invisible to bob");
+    drop(tx);
+    let mut tx = v.begin(&ADMIN_IN_PLAYER);
+    assert_eq!(tx.add_tag(&a, path.clone()), Err(Error::NotWritable), "visible but not his");
+    drop(tx);
+    let mut tx = v.begin(&ALICE);
+    assert!(tx.add_tag(&a, path.clone()).is_ok());
+    assert!(tx.create(None, vec![Tag::new("tagfs", "hostfs_path", "/b.txt")], vec![]).is_ok());
+}
+
+#[test]
 fn copy_shares_content_until_written() {
     let mut v = volume(&[1]);
     let a = create(&mut v, &ALICE, None, vec![name("a")], b"hello");

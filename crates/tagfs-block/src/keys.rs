@@ -9,6 +9,7 @@
 //! | 对象区段 | `05` 对象编号 逻辑块号 | 物理块号、块数 |
 //! | 准备记录 | `06` 事务 片号 | 记录的一片 |
 //! | 已提交事务 | `07` 事务 | 事务描述 |
+//! | 附加记录 | `08` 任意 | 任意（上层单元自用） |
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -24,6 +25,14 @@ pub(crate) const OBJECT: u8 = 4;
 pub(crate) const EXTENT: u8 = 5;
 pub(crate) const PREPARED: u8 = 6;
 pub(crate) const COMMITTED: u8 = 7;
+/// 建在块格式单元之上的单元（如目录单元）自己的记录，键和值由它决定。
+pub(crate) const AUX: u8 = 8;
+
+pub(crate) fn aux(key: &[u8]) -> Vec<u8> {
+    let mut k = vec![AUX];
+    k.extend_from_slice(key);
+    k
+}
 
 pub(crate) fn entity(id: &EntityId) -> Vec<u8> {
     let mut k = vec![ENTITY];

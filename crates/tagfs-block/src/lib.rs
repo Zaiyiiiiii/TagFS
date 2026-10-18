@@ -142,6 +142,25 @@ fn free_list_per_block(bs: usize) -> usize {
     (bs - 16) / 16
 }
 
+/// 附加记录的一项改动。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Aux {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+/// 一次提交的全部内容，见 [`BlockUnit::commit_batch`]。
+#[derive(Default)]
+pub struct Batch<'a> {
+    /// 实体的修改，按顺序应用。
+    pub changes: &'a [Change],
+    /// 附加记录的改动，在修改之后应用。
+    pub aux: &'a [Aux],
+    /// 了结这条准备记录：删掉它（其中的修改不会再被应用，调用者自己放进 `changes`）；
+    /// 第二项为 `true` 时同时记下“这个事务已提交”。
+    pub finish: Option<(TxnId, bool)>,
+}
+
 /// 快照登记：提交号 → 持有它的读者数。
 type Readers = Rc<RefCell<BTreeMap<u64, usize>>>;
 
@@ -378,6 +397,47 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         self.commit(w)
     }
 
+    /// 把一批修改、附加记录和准备记录的了结作为一次提交原子地完成。
+    /// 建在块格式单元之上的单元（如目录单元）靠它把自己的记录和实体的修改放进同一次提交。
+    pub fn commit_batch(&mut self, batch: &Batch<'_>) -> Result<(), UnitError> {
+        self.update(|w| {
+            for c in batch.changes {
+                w.apply(c)?;
+            }
+            for a in batch.aux {
+                match a {
+                    Aux::Put(k, v) => w.put_aux(k, v.clone())?,
+                    Aux::Delete(k) => w.remove_aux(k)?,
+                }
+            }
+            if let Some((txn, as_primary)) = batch.finish {
+                let (info, _) = w.prepared_one(&txn)?.ok_or(UnitError::UnknownTxn(txn))?;
+                w.remove_prepared(&txn)?;
+                if as_primary {
+                    w.put_committed(&info)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// 读一条附加记录。
+    pub fn aux_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, UnitError> {
+        let tree = Tree::open(self.root(), self.bs);
+        tree.get(&*self.dev.borrow(), &keys::aux(key))
+    }
+
+    /// 键以 `prefix` 开头的全部附加记录，按键排序。
+    pub fn aux_list(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, UnitError> {
+        let tree = Tree::open(self.root(), self.bs);
+        let mut out = Vec::new();
+        tree.scan_prefix(&*self.dev.borrow(), &keys::aux(prefix), &mut |k, v| {
+            out.push((k[1..].to_vec(), v.to_vec()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
     /// 全面检查：每个块恰好属于超级块、树节点、对象内容、空闲表、空闲空间中的一种；
     /// 对象引用数和引用它的实体数一致；实体的 Tag 和 Tag 索引一致。
     pub fn verify(&self) -> Result<(), UnitError> {
@@ -430,7 +490,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                     let o = Reader::new(&k[1..]).be_u64()?;
                     extents.push(view::decode_extent(o, k, v)?);
                 }
-                keys::PREPARED | keys::COMMITTED => {}
+                keys::PREPARED | keys::COMMITTED | keys::AUX => {}
                 _ => return Err(UnitError::Corrupt),
             }
             Ok(true)
@@ -531,17 +591,8 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     }
 
     fn commit_prepared(&mut self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
-        self.update(|w| {
-            let (info, changes) = w.prepared_one(&txn)?.ok_or(UnitError::UnknownTxn(txn))?;
-            for c in &changes {
-                w.apply(c)?;
-            }
-            w.remove_prepared(&txn)?;
-            if as_primary {
-                w.put_committed(&info)?;
-            }
-            Ok(())
-        })
+        let (_, changes) = self.with_view(|v| v.prepared_one(&txn))?.ok_or(UnitError::UnknownTxn(txn))?;
+        self.commit_batch(&Batch { changes: &changes, finish: Some((txn, as_primary)), ..Batch::default() })
     }
 
     fn abort_prepared(&mut self, txn: TxnId) -> Result<(), UnitError> {

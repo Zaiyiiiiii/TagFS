@@ -4,7 +4,8 @@
 //! 操作系统实现 [`Policy`]（或用 [`Rules`] 逐条注册），TagFS 只负责执行。调用上下文的类型
 //! 也由操作系统决定（[`Policy::Context`]），TagFS 不看它的内容，只把它交回给规则。
 //!
-//! `tagfs` 命名空间不受规则管辖：任何调用者都不能写它，这一点由卷强制，规则无法放开。
+//! `tagfs` 命名空间不受写入规则管辖：其中由 TagFS 自己维护的键任何调用者都不能写，这一点由卷强制；
+//! 映射的键（见 [`crate::tag::tagfs_keys::is_mapped`]）写它等于修改实体，按 [`Policy::can_modify`] 授权。
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

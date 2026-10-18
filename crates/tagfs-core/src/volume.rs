@@ -351,14 +351,19 @@ impl<P: Policy> Txn<'_, P> {
         Ok((unit, r.tags))
     }
 
-    fn check_tag_writable(&self, tag: &Tag) -> Result<(), Error> {
+    /// 能否在实体上增删这个 Tag。`entity` 是实体当前的 Tag；新建实体时为 `None`。
+    fn check_tag_writable(&self, tag: &Tag, entity: Option<&[Tag]>) -> Result<(), Error> {
         if !tag.within_limits() {
             return Err(Error::TagTooLong);
         }
-        if tag.ns.is_tagfs() || !self.vol.policy.can_write(self.ctx, &tag.ns) {
-            return Err(Error::NotWritable);
-        }
-        Ok(())
+        let allowed = if tag.ns.is_tagfs() {
+            // 映射的键按修改实体授权；新建实体时，能建就能带。
+            tagfs_keys::is_mapped(tag.key.as_str())
+                && entity.is_none_or(|tags| self.vol.policy.can_modify(self.ctx, tags))
+        } else {
+            self.vol.policy.can_write(self.ctx, &tag.ns)
+        };
+        if allowed { Ok(()) } else { Err(Error::NotWritable) }
     }
 
     fn placement(&self, unit: Option<UnitId>) -> Result<UnitId, Error> {
@@ -371,7 +376,7 @@ impl<P: Policy> Txn<'_, P> {
     /// 新实体的 Tag：调用者给的（须可写）加上操作系统在创建时附加的。
     fn creation_tags(&self, tags: Vec<Tag>) -> Result<Vec<Tag>, Error> {
         for t in &tags {
-            self.check_tag_writable(t)?;
+            self.check_tag_writable(t, None)?;
         }
         let mut extra = self.vol.policy.on_create(self.ctx).ok_or(Error::NotWritable)?;
         if extra.iter().any(|t| t.ns.is_tagfs()) {
@@ -454,8 +459,8 @@ impl<P: Policy> Txn<'_, P> {
     }
 
     pub fn add_tag(&mut self, id: &EntityId, tag: Tag) -> Result<(), Error> {
-        let (unit, _) = self.target(id)?;
-        self.check_tag_writable(&tag)?;
+        let (unit, tags) = self.target(id)?;
+        self.check_tag_writable(&tag, Some(&tags))?;
         if let Some((_, tags)) = self.created.get_mut(id) {
             tags.push(tag.clone());
         }
@@ -464,8 +469,8 @@ impl<P: Policy> Txn<'_, P> {
     }
 
     pub fn remove_tag(&mut self, id: &EntityId, tag: Tag) -> Result<(), Error> {
-        let (unit, _) = self.target(id)?;
-        self.check_tag_writable(&tag)?;
+        let (unit, tags) = self.target(id)?;
+        self.check_tag_writable(&tag, Some(&tags))?;
         if let Some((_, tags)) = self.created.get_mut(id) {
             tags.retain(|t| t != &tag);
         }

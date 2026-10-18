@@ -106,6 +106,11 @@ pub enum UnitError {
     Device,
     /// 没有这个事务的准备记录。
     UnknownTxn(TxnId),
+    /// 映射路径不合法：格式不对、越出挂载目录、经过符号链接、在宿主上不能用作文件名，
+    /// 或者一个实体带了不止一个路径。
+    InvalidPath,
+    /// 映射路径在宿主上已经被别的文件占用（或者路径上某一级是文件）。
+    PathTaken,
 }
 
 impl fmt::Display for UnitError {
@@ -117,6 +122,8 @@ impl fmt::Display for UnitError {
             UnitError::Corrupt => f.write_str("unit data is corrupt"),
             UnitError::Device => f.write_str("device error"),
             UnitError::UnknownTxn(t) => write!(f, "no prepared transaction {t}"),
+            UnitError::InvalidPath => f.write_str("invalid host path"),
+            UnitError::PathTaken => f.write_str("host path already taken"),
         }
     }
 }

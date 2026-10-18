@@ -149,4 +149,17 @@ impl Tag {
 pub mod tagfs_keys {
     /// 跨单元事务尚未在所有参与单元完成，值为事务编号。带它的实体在结果确定前只读。
     pub const TXN_PENDING: &str = "txn_pending";
+
+    /// 宿主层级文件系统（Windows、Linux 这一类按目录树组织的文件系统）里的路径。
+    ///
+    /// 只在目录单元里有意义：值是以挂载目录为根的路径，如 `/abc/bcd/1.file`，实体的内容就是那个文件。
+    /// 这个 Tag 不是存下来的，而是映射出来的：增、删、改它，就是在宿主上建立、删除、移动对应的文件。
+    /// 其他单元里它只是普通的 Tag。
+    pub const HOSTFS_PATH: &str = "hostfs_path";
+
+    /// 上层可以写的 `tagfs` 键。它们映射到存储单元里的实际状态，写它就是改那个状态，
+    /// 所以按“修改实体”来授权（[`crate::Policy::can_modify`]）。其余 `tagfs` 键只有 TagFS 自己写。
+    pub fn is_mapped(key: &str) -> bool {
+        key == HOSTFS_PATH
+    }
 }

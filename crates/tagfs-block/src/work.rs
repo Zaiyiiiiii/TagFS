@@ -391,6 +391,14 @@ impl<D: BlockDevice> Work<D> {
         self.put(keys::committed(&info.id), v)
     }
 
+    pub(crate) fn put_aux(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), UnitError> {
+        self.put(keys::aux(key), value)
+    }
+
+    pub(crate) fn remove_aux(&mut self, key: &[u8]) -> Result<(), UnitError> {
+        self.del(&keys::aux(key)).map(|_| ())
+    }
+
     pub(crate) fn remove_committed(&mut self, txn: &TxnId) -> Result<(), UnitError> {
         self.del(&keys::committed(txn)).map(|_| ())
     }
