@@ -136,7 +136,7 @@ pub trait Unit {
     fn prepare(&mut self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError>;
 
     /// 所有还没有了结的准备记录。卷在单元上线时据此恢复事务。
-    fn prepared(&self) -> Vec<(TxnInfo, Vec<Change>)>;
+    fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError>;
 
     /// 应用准备好的修改并删除准备记录，原子地完成。`as_primary` 时同时记下
     /// “这个事务已提交”，这就是整个事务的提交点。
@@ -146,21 +146,23 @@ pub trait Unit {
     fn abort_prepared(&mut self, txn: TxnId) -> Result<(), UnitError>;
 
     /// 作为主单元记下的、还没清掉的已提交事务。
-    fn committed(&self) -> Vec<TxnInfo>;
+    fn committed(&self) -> Result<Vec<TxnInfo>, UnitError>;
 
     /// 清掉“已提交”记录。卷确认所有参与单元都完成后调用。
     fn forget(&mut self, txn: TxnId) -> Result<(), UnitError>;
 }
 
+/// 已提交状态的只读视图。存储单元的读取可能失败（设备出错、校验不通过），
+/// 所以每个方法都可能返回错误；这和“不存在”是两回事。
 pub trait Snapshot {
-    fn get(&self, id: &EntityId) -> Option<EntityRecord>;
+    fn get(&self, id: &EntityId) -> Result<Option<EntityRecord>, UnitError>;
 
     /// 用索引回答叶子条件：满足条件的实体（只看这个条件）。没有相应索引时返回 `None`，
     /// 卷会改为扫描。
-    fn probe(&self, probe: &Probe<'_>) -> Option<Vec<EntityId>>;
+    fn probe(&self, probe: &Probe<'_>) -> Result<Option<Vec<EntityId>>, UnitError>;
 
     /// 单元里的全部实体。
-    fn all(&self) -> Vec<EntityId>;
+    fn all(&self) -> Result<Vec<EntityId>, UnitError>;
 
     /// 读实体内容，返回读到的字节数（到达末尾时少于 `buf.len()`）。
     fn read(&self, id: &EntityId, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError>;

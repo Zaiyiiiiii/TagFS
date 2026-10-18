@@ -117,8 +117,13 @@ impl<P: Policy> Volume<P> {
     }
 
     /// 找实体所在的单元，不看可见性。
-    fn locate(&self, id: &EntityId) -> Option<(UnitId, EntityRecord)> {
-        self.units.iter().find_map(|u| u.snapshot().get(id).map(|r| (u.id(), r)))
+    fn locate(&self, id: &EntityId) -> Result<Option<(UnitId, EntityRecord)>, Error> {
+        for u in &self.units {
+            if let Some(r) = u.snapshot().get(id)? {
+                return Ok(Some((u.id(), r)));
+            }
+        }
+        Ok(None)
     }
 
     fn visible(&self, ctx: &P::Context, tags: &[Tag]) -> bool {
@@ -141,28 +146,32 @@ impl<P: Policy> Volume<P> {
         true
     }
 
-    fn visible_record(&self, ctx: &P::Context, id: &EntityId) -> Option<(UnitId, EntityRecord)> {
-        self.locate(id).filter(|(_, r)| self.visible(ctx, &r.tags))
+    /// 实体所在的单元和记录；不可见当作不存在，返回 `NotFound`。
+    fn visible_record(&self, ctx: &P::Context, id: &EntityId) -> Result<(UnitId, EntityRecord), Error> {
+        self.locate(id)?.filter(|(_, r)| self.visible(ctx, &r.tags)).ok_or(Error::NotFound)
     }
 
     pub fn get(&self, ctx: &P::Context, id: &EntityId) -> Result<Entity, Error> {
-        let (_, r) = self.visible_record(ctx, id).ok_or(Error::NotFound)?;
+        let (_, r) = self.visible_record(ctx, id)?;
         Ok(Entity { id: r.id, tags: r.tags, size: r.size })
     }
 
     pub fn read(&self, ctx: &P::Context, id: &EntityId, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let (unit, _) = self.visible_record(ctx, id).ok_or(Error::NotFound)?;
+        let (unit, _) = self.visible_record(ctx, id)?;
         let i = self.position(unit).ok_or(Error::NotFound)?;
         Ok(self.units[i].snapshot().read(id, offset, buf)?)
     }
 
     /// 满足条件、且对调用者可见的实体，按 EntityId 排序。
-    pub fn query(&self, ctx: &P::Context, query: &Query) -> Vec<EntityId> {
+    pub fn query(&self, ctx: &P::Context, query: &Query) -> Result<Vec<EntityId>, Error> {
         let mut out = Vec::new();
         for (_, snap) in self.snapshots() {
-            let candidates = candidates(&*snap, query).unwrap_or_else(|| snap.all());
+            let candidates = match candidates(&*snap, query)? {
+                Some(c) => c,
+                None => snap.all()?,
+            };
             for id in candidates {
-                if let Some(r) = snap.get(&id)
+                if let Some(r) = snap.get(&id)?
                     && query.matches(&r.tags)
                     && self.visible(ctx, &r.tags)
                 {
@@ -172,7 +181,7 @@ impl<P: Policy> Volume<P> {
         }
         out.sort();
         out.dedup();
-        out
+        Ok(out)
     }
 
     pub fn begin<'a>(&'a mut self, ctx: &'a P::Context) -> Txn<'a, P> {
@@ -184,7 +193,7 @@ impl<P: Policy> Volume<P> {
         // 带准备记录的单元：问主单元。
         let mut work = Vec::new();
         for u in &self.units {
-            for (info, changes) in u.prepared() {
+            for (info, changes) in u.prepared()? {
                 work.push((u.id(), info, changes));
             }
         }
@@ -194,11 +203,11 @@ impl<P: Policy> Volume<P> {
                 self.mark_in_doubt(unit, info.id, &changes)?;
                 continue;
             };
-            let committed = self.units[primary].committed().iter().any(|t| t.id == info.id);
+            let committed = self.units[primary].committed()?.iter().any(|t| t.id == info.id);
             let i = self.position(unit).expect("online");
             if committed {
                 self.units[i].commit_prepared(info.id, false)?;
-            } else if self.units[i].prepared().iter().any(|(t, _)| t.id == info.id) {
+            } else if self.has_prepared(i, info.id)? {
                 // 主单元没有提交：要么它自己还停在准备阶段（提交点之前就断了），
                 // 要么它已经放弃。两种情况都放弃这个事务。
                 self.abort_everywhere(info.id)?;
@@ -207,10 +216,14 @@ impl<P: Policy> Volume<P> {
         // 主单元记下的已提交事务：全部参与单元都完成后，去掉标记并清掉记录。
         let mut done = Vec::new();
         for u in &self.units {
-            for info in u.committed() {
-                let finished = info.participants.iter().all(|p| {
-                    self.position(*p).is_some_and(|i| !self.units[i].prepared().iter().any(|(t, _)| t.id == info.id))
-                });
+            for info in u.committed()? {
+                let mut finished = true;
+                for p in &info.participants {
+                    finished &= match self.position(*p) {
+                        Some(i) => !self.has_prepared(i, info.id)?,
+                        None => false,
+                    };
+                }
                 if finished {
                     done.push((u.id(), info));
                 }
@@ -226,9 +239,13 @@ impl<P: Policy> Volume<P> {
         Ok(())
     }
 
+    fn has_prepared(&self, unit: usize, txn: TxnId) -> Result<bool, Error> {
+        Ok(self.units[unit].prepared()?.iter().any(|(t, _)| t.id == txn))
+    }
+
     fn abort_everywhere(&mut self, txn: TxnId) -> Result<(), Error> {
         for i in 0..self.units.len() {
-            if self.units[i].prepared().iter().any(|(t, _)| t.id == txn) {
+            if self.has_prepared(i, txn)? {
                 self.units[i].abort_prepared(txn)?;
                 let id = self.units[i].id();
                 self.clear_pending(id, txn)?;
@@ -241,14 +258,12 @@ impl<P: Policy> Volume<P> {
         let i = self.position(unit).expect("online");
         let snap = self.units[i].snapshot();
         let tag = pending_tag(txn);
-        let marks: Vec<Change> = changes
-            .iter()
-            .map(Change::entity)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|id| snap.get(id).is_some_and(|r| !r.tags.contains(&tag)))
-            .map(|id| Change::AddTag { id, tag: tag.clone() })
-            .collect();
+        let mut marks = Vec::new();
+        for id in changes.iter().map(Change::entity).collect::<BTreeSet<_>>() {
+            if snap.get(&id)?.is_some_and(|r| !r.tags.contains(&tag)) {
+                marks.push(Change::AddTag { id, tag: tag.clone() });
+            }
+        }
         if !marks.is_empty() {
             self.units[i].apply(&marks)?;
         }
@@ -260,9 +275,18 @@ impl<P: Policy> Volume<P> {
         let tag = pending_tag(txn);
         let snap = self.units[i].snapshot();
         let probe = crate::query::Probe::Is(&tag);
-        let ids = snap.probe(&probe).unwrap_or_else(|| {
-            snap.all().into_iter().filter(|id| snap.get(id).is_some_and(|r| r.tags.contains(&tag))).collect()
-        });
+        let ids = match snap.probe(&probe)? {
+            Some(ids) => ids,
+            None => {
+                let mut ids = Vec::new();
+                for id in snap.all()? {
+                    if snap.get(&id)?.is_some_and(|r| r.tags.contains(&tag)) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            }
+        };
         let clears: Vec<Change> = ids.into_iter().map(|id| Change::RemoveTag { id, tag: tag.clone() }).collect();
         if !clears.is_empty() {
             self.units[i].apply(&clears)?;
@@ -272,23 +296,33 @@ impl<P: Policy> Volume<P> {
 }
 
 /// 用索引算候选集；算不出时返回 `None`（改为扫描）。候选集只是上界，最后还要逐个核对。
-fn candidates(snap: &dyn Snapshot, query: &Query) -> Option<Vec<EntityId>> {
-    match query {
+fn candidates(snap: &dyn Snapshot, query: &Query) -> Result<Option<Vec<EntityId>>, UnitError> {
+    Ok(match query {
         Query::And(qs) => {
-            let mut sets = qs.iter().filter_map(|q| candidates(snap, q));
-            let first: BTreeSet<EntityId> = sets.next()?.into_iter().collect();
-            Some(sets.fold(first, |acc, s| s.into_iter().filter(|id| acc.contains(id)).collect()).into_iter().collect())
+            let mut acc: Option<BTreeSet<EntityId>> = None;
+            for q in qs {
+                if let Some(s) = candidates(snap, q)? {
+                    acc = Some(match acc {
+                        None => s.into_iter().collect(),
+                        Some(acc) => s.into_iter().filter(|id| acc.contains(id)).collect(),
+                    });
+                }
+            }
+            acc.map(|s| s.into_iter().collect())
         }
         Query::Or(qs) => {
             let mut all = BTreeSet::new();
             for q in qs {
-                all.extend(candidates(snap, q)?);
+                match candidates(snap, q)? {
+                    Some(s) => all.extend(s),
+                    None => return Ok(None),
+                }
             }
             Some(all.into_iter().collect())
         }
         Query::All | Query::Not(_) => None,
-        leaf => snap.probe(&leaf.probe().expect("leaf")),
-    }
+        leaf => snap.probe(&leaf.probe().expect("leaf"))?,
+    })
 }
 
 /// 一组修改。提交前不影响卷；不提交就放弃。
@@ -310,7 +344,7 @@ impl<P: Policy> Txn<'_, P> {
         if let Some(created) = self.created.get(id) {
             return Ok(created.clone());
         }
-        let (unit, r) = self.vol.visible_record(self.ctx, id).ok_or(Error::NotFound)?;
+        let (unit, r) = self.vol.visible_record(self.ctx, id)?;
         if is_pending(&r.tags) {
             return Err(Error::Pending);
         }
@@ -394,14 +428,14 @@ impl<P: Policy> Txn<'_, P> {
         if let Some(created) = self.created.get(id) {
             return Ok(created.clone());
         }
-        let (unit, r) = self.vol.visible_record(self.ctx, id).ok_or(Error::NotFound)?;
+        let (unit, r) = self.vol.visible_record(self.ctx, id)?;
         Ok((unit, r.tags))
     }
 
     fn read_all(&self, unit: UnitId, id: &EntityId) -> Result<Vec<u8>, Error> {
         let i = self.vol.position(unit).ok_or(Error::NoUnit)?;
         let snap = self.vol.units[i].snapshot();
-        let size = snap.get(id).ok_or(Error::NotFound)?.size;
+        let size = snap.get(id)?.ok_or(Error::NotFound)?.size;
         let mut buf = vec![0u8; size as usize];
         let n = snap.read(id, 0, &mut buf)?;
         buf.truncate(n);

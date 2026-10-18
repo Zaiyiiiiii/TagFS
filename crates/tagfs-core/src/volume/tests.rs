@@ -90,13 +90,13 @@ fn names_are_plain_tags_and_may_repeat() {
     let mut v = volume(&[1]);
     let a = create(&mut v, &ALICE, None, vec![name("report.pdf"), Tag::new("user", "project", "alpha")], b"A");
     let b = create(&mut v, &ALICE, None, vec![name("report.pdf"), Tag::new("user", "project", "beta")], b"B");
-    assert_eq!(v.query(&ALICE, &Query::is("user", "name", "report.pdf")), {
+    assert_eq!(v.query(&ALICE, &Query::is("user", "name", "report.pdf")).unwrap(), {
         let mut ids = vec![a, b];
         ids.sort();
         ids
     });
     let both = Query::And(vec![Query::is("user", "name", "report.pdf"), Query::is("user", "project", "alpha")]);
-    assert_eq!(v.query(&ALICE, &both), vec![a]);
+    assert_eq!(v.query(&ALICE, &both).unwrap(), vec![a]);
     assert_eq!(read_all(&v, &ALICE, &b), b"B");
 }
 
@@ -106,7 +106,7 @@ fn invisible_is_the_same_as_missing() {
     let a = create(&mut v, &ALICE, None, vec![name("secret")], b"x");
     assert_eq!(v.get(&BOB, &a), Err(Error::NotFound));
     assert_eq!(v.get(&BOB, &EntityId([9; 16])), Err(Error::NotFound));
-    assert!(v.query(&BOB, &Query::All).is_empty());
+    assert!(v.query(&BOB, &Query::All).unwrap().is_empty());
     assert_eq!(v.read(&BOB, &a, 0, &mut [0u8; 1]), Err(Error::NotFound));
     let mut tx = v.begin(&BOB);
     assert_eq!(tx.add_tag(&a, name("mine")), Err(Error::NotFound));
@@ -124,7 +124,7 @@ fn a_capability_relaxes_only_its_own_boundary() {
     // 同一个用户换个应用也看不见；回到 notes 才看得见。
     assert_eq!(v.get(&ALICE_IN_PLAYER, &app_only), Err(Error::NotFound));
     assert!(v.get(&ALICE, &app_only).is_ok());
-    assert_eq!(v.query(&ALICE_IN_PLAYER, &Query::has("user", "name")), vec![plain]);
+    assert_eq!(v.query(&ALICE_IN_PLAYER, &Query::has("user", "name")).unwrap(), vec![plain]);
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn a_failed_change_leaves_the_unit_untouched() {
     let err = unit
         .apply(&[Change::Create { id: x, tags: vec![], content: vec![] }, Change::Delete { id: EntityId([2; 16]) }]);
     assert!(err.is_err());
-    assert!(unit.snapshot().get(&x).is_none());
+    assert!(unit.snapshot().get(&x).unwrap().is_none());
 }
 
 #[test]
@@ -203,11 +203,11 @@ fn units_are_one_volume_and_leave_with_their_entities() {
     let mut v = volume(&[1, 2]);
     let a = create(&mut v, &ALICE, Some(1), vec![name("on-1")], b"");
     let b = create(&mut v, &ALICE, Some(2), vec![name("on-2")], b"");
-    assert_eq!(v.query(&ALICE, &Query::has("user", "name")).len(), 2);
+    assert_eq!(v.query(&ALICE, &Query::has("user", "name")).unwrap().len(), 2);
 
     let two = v.detach(uid(2)).unwrap();
     assert_eq!(v.get(&ALICE, &b), Err(Error::NotFound));
-    assert_eq!(v.query(&ALICE, &Query::has("user", "name")), vec![a]);
+    assert_eq!(v.query(&ALICE, &Query::has("user", "name")).unwrap(), vec![a]);
     let mut tx = v.begin(&ALICE);
     assert_eq!(tx.create(Some(uid(2)), vec![], vec![]), Err(Error::NoUnit));
     drop(tx);
@@ -217,7 +217,7 @@ fn units_are_one_volume_and_leave_with_their_entities() {
 }
 
 fn pending_tags(v: &Volume<Rules<Ctx>>, ctx: &Ctx) -> usize {
-    v.query(ctx, &Query::has("tagfs", "txn_pending")).len()
+    v.query(ctx, &Query::has("tagfs", "txn_pending")).unwrap().len()
 }
 
 #[test]
@@ -230,11 +230,11 @@ fn a_cross_unit_transaction_is_atomic() {
     tx.commit().unwrap();
 
     assert_eq!(read_all(&v, &ALICE, &b), b"aaa");
-    assert_eq!(v.query(&ALICE, &Query::is("user", "copied_to", b.to_string())), vec![a]);
+    assert_eq!(v.query(&ALICE, &Query::is("user", "copied_to", b.to_string())).unwrap(), vec![a]);
     // 全部完成后不留标记，主单元也清掉了记录。
     assert_eq!(pending_tags(&v, &ALICE), 0);
-    assert!(v.unit(uid(1)).unwrap().committed().is_empty());
-    assert!(v.unit(uid(2)).unwrap().committed().is_empty());
+    assert!(v.unit(uid(1)).unwrap().committed().unwrap().is_empty());
+    assert!(v.unit(uid(2)).unwrap().committed().unwrap().is_empty());
 }
 
 /// 手工搭出“主单元已提交、参与单元还没完成就断电”的现场。
@@ -290,7 +290,7 @@ fn an_undecided_unit_stays_online_with_pending_tags() {
     assert!(v.get(&ALICE, &x).is_ok());
     assert!(v.get(&ALICE, &y).is_ok());
     assert_eq!(pending_tags(&v, &ALICE), 0);
-    assert!(v.unit(uid(1)).unwrap().committed().is_empty());
+    assert!(v.unit(uid(1)).unwrap().committed().unwrap().is_empty());
     let mut tx = v.begin(&ALICE);
     assert!(tx.add_tag(&e, name("other")).is_ok());
 }
@@ -307,8 +307,8 @@ fn a_transaction_the_primary_never_committed_is_dropped() {
     assert_eq!(v.get(&ALICE, &x), Err(Error::NotFound));
     assert_eq!(v.get(&ALICE, &y), Err(Error::NotFound));
     assert_eq!(pending_tags(&v, &ALICE), 0);
-    assert!(v.unit(uid(1)).unwrap().prepared().is_empty());
-    assert!(v.unit(uid(2)).unwrap().prepared().is_empty());
+    assert!(v.unit(uid(1)).unwrap().prepared().unwrap().is_empty());
+    assert!(v.unit(uid(2)).unwrap().prepared().unwrap().is_empty());
 }
 
 #[test]
@@ -318,8 +318,8 @@ fn committed_primary_keeps_its_record_until_every_participant_is_done() {
     v.attach(Box::new(one)).unwrap();
     // 单元 2 还没上线：x 已经可见，但带着标记；主单元留着记录。
     assert!(v.get(&ALICE, &x).unwrap().tags.iter().any(|t| t.ns.is_tagfs()));
-    assert_eq!(v.unit(uid(1)).unwrap().committed().len(), 1);
+    assert_eq!(v.unit(uid(1)).unwrap().committed().unwrap().len(), 1);
     v.attach(Box::new(two)).unwrap();
     assert_eq!(pending_tags(&v, &ALICE), 0);
-    assert!(v.unit(uid(1)).unwrap().committed().is_empty());
+    assert!(v.unit(uid(1)).unwrap().committed().unwrap().is_empty());
 }

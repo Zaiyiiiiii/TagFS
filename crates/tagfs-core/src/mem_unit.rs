@@ -162,8 +162,8 @@ impl Unit for MemUnit {
         Ok(())
     }
 
-    fn prepared(&self) -> Vec<(TxnInfo, Vec<Change>)> {
-        self.state.prepared.values().cloned().collect()
+    fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError> {
+        Ok(self.state.prepared.values().cloned().collect())
     }
 
     fn commit_prepared(&mut self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
@@ -184,8 +184,8 @@ impl Unit for MemUnit {
         Ok(())
     }
 
-    fn committed(&self) -> Vec<TxnInfo> {
-        self.state.committed.values().cloned().collect()
+    fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {
+        Ok(self.state.committed.values().cloned().collect())
     }
 
     fn forget(&mut self, txn: TxnId) -> Result<(), UnitError> {
@@ -199,25 +199,28 @@ impl Unit for MemUnit {
 struct MemSnapshot(Arc<State>);
 
 impl Snapshot for MemSnapshot {
-    fn get(&self, id: &EntityId) -> Option<EntityRecord> {
-        let (tags, object) = self.0.entities.get(id)?;
-        Some(EntityRecord { id: *id, tags: tags.clone(), size: self.0.objects[object].0.len() as u64 })
+    fn get(&self, id: &EntityId) -> Result<Option<EntityRecord>, UnitError> {
+        Ok(self.0.entities.get(id).map(|(tags, object)| EntityRecord {
+            id: *id,
+            tags: tags.clone(),
+            size: self.0.objects[object].0.len() as u64,
+        }))
     }
 
-    fn probe(&self, probe: &Probe<'_>) -> Option<Vec<EntityId>> {
+    fn probe(&self, probe: &Probe<'_>) -> Result<Option<Vec<EntityId>>, UnitError> {
         // 参考实现没有索引，直接按条件逐个比对；结果和有索引的实现必须一致。
-        Some(
+        Ok(Some(
             self.0
                 .entities
                 .iter()
                 .filter(|(_, (tags, _))| tags.iter().any(|t| probe.matches(t)))
                 .map(|(id, _)| *id)
                 .collect(),
-        )
+        ))
     }
 
-    fn all(&self) -> Vec<EntityId> {
-        self.0.entities.keys().copied().collect()
+    fn all(&self) -> Result<Vec<EntityId>, UnitError> {
+        Ok(self.0.entities.keys().copied().collect())
     }
 
     fn read(&self, id: &EntityId, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError> {
