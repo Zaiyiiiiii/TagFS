@@ -8,6 +8,7 @@
 //! 或 [`Unit::commit_prepared`] 要么全部生效，要么全部不生效，断电后也一样。
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -162,6 +163,11 @@ pub trait Unit {
 
     /// 一致性检查，怎么查由单元自己决定。发现问题返回 [`UnitError::Corrupt`] 或别的错误。
     fn check(&mut self) -> Result<(), UnitError>;
+
+    /// 单元对自己的描述（如容量、空闲空间），给人看的名称和值。各后端自己决定说什么。
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 /// 已提交状态的只读视图。存储单元的读取可能失败（设备出错、校验不通过），

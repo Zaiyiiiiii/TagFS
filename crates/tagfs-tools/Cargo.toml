@@ -10,7 +10,8 @@ name = "tagfs"
 path = "src/main.rs"
 
 [dependencies]
-tagfs = { path = "../tagfs" }
+tagfs-core = { path = "../tagfs-core" }
+tagfs-proto = { path = "../tagfs-proto" }
 
 [lints]
 workspace = true

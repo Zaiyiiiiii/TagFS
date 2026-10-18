@@ -12,7 +12,7 @@
 
 use std::ops::Bound;
 
-use tagfs::{Key, Namespace, Query, Tag, Value};
+use tagfs_core::{Key, Namespace, Query, Tag, Value};
 
 fn value(s: &str) -> Value {
     match s.strip_prefix('#') {

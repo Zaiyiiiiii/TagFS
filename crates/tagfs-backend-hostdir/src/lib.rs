@@ -1214,6 +1214,23 @@ impl Unit for DirUnit {
         self.rescan()?;
         self.inner.get_mut().image.verify()
     }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        let inner = self.inner.borrow();
+        let snap = inner.image.snapshot();
+        let (ns, key) = hostfs_key();
+        let files = snap.probe(&Probe::Has { ns: &ns, key: &key }).ok().flatten().map_or(0, |f| f.len());
+        let all = snap.all().map_or(0, |a| a.len());
+        let mut out = vec![
+            ("root", self.root.display().to_string()),
+            ("files", format!("{files} mapped from the directory, {} only in the image", all - files)),
+            ("live sync", String::from(if self.is_live() { "yes" } else { "no" })),
+        ];
+        for (name, value) in inner.image.describe() {
+            out.push((if name == "size" { "image size" } else { name }, value));
+        }
+        out
+    }
 }
 
 /// `path` 是不是目录单元的挂载目录。只看，不改。

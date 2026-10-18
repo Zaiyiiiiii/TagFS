@@ -668,6 +668,16 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     fn check(&mut self) -> Result<(), UnitError> {
         self.verify()
     }
+
+    fn describe(&self) -> Vec<(&'static str, alloc::string::String)> {
+        use alloc::format;
+        let bs = self.bs as u64;
+        vec![
+            ("size", format!("{} bytes", self.total_blocks() * bs)),
+            ("free", format!("{} bytes", self.free_blocks() * bs)),
+            ("generation", format!("{}", self.generation())),
+        ]
+    }
 }
 
 struct BlockSnapshot<D: BlockDevice> {

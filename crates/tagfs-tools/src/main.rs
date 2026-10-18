@@ -1,6 +1,7 @@
-//! `tagfs` 命令行工具：管理员视角操作单个存储单元，不设可见性和权限限制。
+//! `tagfs` 命令行工具：连到运行中的卷，面向整个卷工作。
 //!
-//! 它只通过统一的单元接口工作，不区分单元是哪种后端。各后端只在建立单元时不同，那由各自的工具负责。
+//! 它不区分单元是哪种后端：各后端只在建立单元、把单元加入卷时不同，那由各自的工具负责。
+//! 权限属于操作系统层，这里不涉及。
 
 mod syntax;
 
@@ -8,26 +9,29 @@ use std::fmt::Display;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use tagfs::{EntityId, SystemIds, Tag, Unit, Unrestricted, Volume};
+use tagfs_core::{EntityId, Tag, UnitId};
+use tagfs_proto::{Client, EntityInfo, Op, Request, Response};
 
 const USAGE: &str = "\
-用法：tagfs <命令> <单元> [参数...]
+用法：tagfs <命令> [参数...]
 
-<单元> 是任意一种存储单元所在的位置（由认得它的后端打开）。
+连到运行中的卷（tagfs-volume）。卷由若干单元组成，查询和读写面向整个卷。
 
-  info <单元>                    单元身份和实体数
-  check <单元>                   一致性检查
-  find <单元> [条件...]          查找满足条件的实体，列出 ID、长度、Tag
-  show <单元> <ID>               实体的 Tag 和长度
-  cat <单元> <ID>                实体内容写到标准输出
-  put <单元> <文件|-> [Tag...]   新建实体，内容取自文件（- 为标准输入），返回 ID
-  tag <单元> <ID> [+Tag|-Tag...] 增删 Tag
-  cp <单元> <ID> [Tag...]        复制实体，新实体带给出的 Tag，返回 ID
-  rm <单元> <ID>...              删除实体
+  units                          卷里的单元：身份、后端、位置、是否在线、单元自己的描述
+  check <单元>                   单元的一致性检查
+  detach <单元>                  把单元移出卷
+  find [条件...]                 查找满足条件的实体，列出 ID、长度、Tag
+  show <ID>                      实体的 Tag 和长度
+  cat <ID>                       实体内容写到标准输出
+  put <文件|-> [--unit <单元>] [Tag...]
+                                 新建实体，内容取自文件（- 为标准输入），返回 ID；不指定单元时由卷决定
+  tag <ID> [+Tag|-Tag...]        增删 Tag
+  cp <ID> [Tag...]               复制实体，新实体带给出的 Tag，返回 ID
+  rm <ID>...                     删除实体
 
 Tag：ns:key（无值）、ns:key=文本、ns:key=#123（uint）。
 条件：ns:key（带这个键）、ns:key=值、ns:key^=前缀、ns:key>=值（还有 > <= <），前加 ! 取反，多个条件取“且”。
-单元由各后端自己的工具建立（tagfs-file、tagfs-disk、tagfs-hostdir），后端特有的信息也在那里查看。";
+单元由各后端自己的工具建立并加入卷：tagfs-file、tagfs-disk、tagfs-hostdir。";
 
 /// 写一行到标准输出。写不进去时返回错误（见 [`io_out`]），不像 `println!` 那样崩溃。
 macro_rules! say {
@@ -61,18 +65,50 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn open(path: &str) -> Result<Box<dyn Unit>, String> {
-    tagfs::open_unit(path).map_err(|e| format!("{path}: {e}"))
-}
+/// 和卷的一次请求。卷报告的错误转成本工具的错误。
+struct Volume(Client);
 
-fn volume(path: &str) -> Result<Volume<Unrestricted>, String> {
-    let mut vol = Volume::new(Unrestricted, Box::new(SystemIds));
-    vol.attach(open(path)?).map_err(err)?;
-    Ok(vol)
+impl Volume {
+    fn connect() -> Result<Volume, String> {
+        Client::connect().map(Volume).map_err(|e| format!("cannot reach the volume (is tagfs-volume running?): {e}"))
+    }
+
+    fn call(&mut self, req: Request) -> Result<Response, String> {
+        match self.0.call(&req).map_err(err)? {
+            Response::Error(e) => Err(e),
+            r => Ok(r),
+        }
+    }
+
+    fn get(&mut self, id: EntityId) -> Result<EntityInfo, String> {
+        match self.call(Request::Get { id })? {
+            Response::Entity(e) => Ok(e),
+            other => Err(format!("unexpected answer {other:?}")),
+        }
+    }
+
+    fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<EntityId>>, String> {
+        match self.call(Request::Apply { ops })? {
+            Response::Applied(r) => Ok(r),
+            other => Err(format!("unexpected answer {other:?}")),
+        }
+    }
 }
 
 fn entity_id(s: &str) -> Result<EntityId, String> {
     s.parse().map_err(|_| format!("not an entity id: {s:?}"))
+}
+
+fn unit_id(s: &str) -> Result<UnitId, String> {
+    let bad = || format!("not a unit id: {s:?}");
+    if s.len() != 32 {
+        return Err(bad());
+    }
+    let mut b = [0u8; 16];
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(2 * i..2 * i + 2).ok_or_else(bad)?, 16).map_err(|_| bad())?;
+    }
+    Ok(UnitId(b))
 }
 
 fn tags(args: &[String]) -> Result<Vec<Tag>, String> {
@@ -94,32 +130,53 @@ fn run(args: &[String]) -> Result<(), String> {
         say!("{USAGE}");
         return Ok(());
     }
-    let path = arg(args, 1, "unit")?;
-    let rest = &args[2..];
+    let rest = &args[1..];
+    let mut vol = Volume::connect()?;
     match cmd {
-        "info" => info(path)?,
-        "check" => check(path)?,
+        "units" => {
+            let Response::Units(units) = vol.call(Request::Units)? else { return Err("unexpected answer".into()) };
+            for u in units {
+                let id = u.id.map_or_else(|| String::from("-"), |id| hex(&id.0));
+                say!("{id}  {}  {}", u.backend, u.location);
+                match &u.offline {
+                    Some(why) => say!("    offline: {why}"),
+                    None => {
+                        for (k, v) in &u.details {
+                            say!("    {k}: {v}");
+                        }
+                    }
+                }
+            }
+        }
+        "check" => {
+            vol.call(Request::Check { unit: unit_id(arg(args, 1, "unit")?)? })?;
+            say!("ok");
+        }
+        "detach" => {
+            vol.call(Request::Detach { unit: unit_id(arg(args, 1, "unit")?)? })?;
+        }
         "find" => {
-            let vol = volume(path)?;
             let query = syntax::query(rest)?;
-            let mut cursor = tagfs::Cursor::new(query, 1000);
+            let mut after = None;
             let out = std::io::stdout();
             let mut out = out.lock();
             loop {
-                let page = cursor.next_page(&vol, &()).map_err(err)?;
+                let Response::Ids(page) = vol.call(Request::Query { query: query.clone(), after, limit: 1000 })? else {
+                    return Err("unexpected answer".into());
+                };
                 if page.is_empty() {
                     break;
                 }
+                after = page.last().copied();
                 for id in page {
-                    let e = vol.get(&(), &id).map_err(err)?;
+                    let e = vol.get(id)?;
                     writeln!(out, "{}", line(&id, e.size, &e.tags)).map_err(io_out)?;
                 }
             }
         }
         "show" => {
-            let vol = volume(path)?;
-            let id = entity_id(arg(args, 2, "entity id")?)?;
-            let e = vol.get(&(), &id).map_err(err)?;
+            let id = entity_id(arg(args, 1, "entity id")?)?;
+            let e = vol.get(id)?;
             say!("id    {id}");
             say!("size  {}", e.size);
             for t in &e.tags {
@@ -127,80 +184,60 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "cat" => {
-            let vol = volume(path)?;
-            let id = entity_id(arg(args, 2, "entity id")?)?;
+            let id = entity_id(arg(args, 1, "entity id")?)?;
             let out = std::io::stdout();
             let mut out = out.lock();
-            let mut buf = vec![0u8; 1 << 20];
             let mut offset = 0u64;
             loop {
-                let n = vol.read(&(), &id, offset, &mut buf).map_err(err)?;
-                if n == 0 {
+                let Response::Bytes(chunk) = vol.call(Request::Read { id, offset, len: 1 << 20 })? else {
+                    return Err("unexpected answer".into());
+                };
+                if chunk.is_empty() {
                     break;
                 }
-                out.write_all(&buf[..n]).map_err(io_out)?;
-                offset += n as u64;
+                out.write_all(&chunk).map_err(io_out)?;
+                offset += chunk.len() as u64;
             }
         }
         "put" => {
-            let source = arg(args, 2, "file")?;
+            let source = arg(args, 1, "file")?;
+            let mut rest = &args[2..];
+            let mut unit = None;
+            if rest.first().map(String::as_str) == Some("--unit") {
+                unit = Some(unit_id(arg(rest, 1, "unit")?)?);
+                rest = &rest[2..];
+            }
             let mut content = Vec::new();
             if source == "-" {
                 std::io::stdin().read_to_end(&mut content).map_err(err)?;
             } else {
                 content = std::fs::read(source).map_err(err)?;
             }
-            let tags = tags(&args[3..])?;
-            let mut vol = volume(path)?;
-            let mut tx = vol.begin(&());
-            let id = tx.create(None, tags, content).map_err(err)?;
-            tx.commit().map_err(err)?;
-            say!("{id}");
+            let ids = vol.apply(vec![Op::Create { unit, tags: tags(rest)?, content }])?;
+            say!("{}", ids[0].ok_or("no id returned")?);
         }
         "tag" => {
-            let id = entity_id(arg(args, 2, "entity id")?)?;
-            let mut vol = volume(path)?;
-            let mut tx = vol.begin(&());
-            for op in &args[3..] {
-                match op.split_at_checked(1) {
-                    Some(("+", t)) => tx.add_tag(&id, syntax::tag(t)?).map_err(err)?,
-                    Some(("-", t)) => tx.remove_tag(&id, syntax::tag(t)?).map_err(err)?,
+            let id = entity_id(arg(args, 1, "entity id")?)?;
+            let mut ops = Vec::new();
+            for op in &args[2..] {
+                ops.push(match op.split_at_checked(1) {
+                    Some(("+", t)) => Op::AddTag { id, tag: syntax::tag(t)? },
+                    Some(("-", t)) => Op::RemoveTag { id, tag: syntax::tag(t)? },
                     _ => return Err(format!("expected +tag or -tag, got {op:?}")),
-                }
+                });
             }
-            tx.commit().map_err(err)?;
+            vol.apply(ops)?;
         }
         "cp" => {
-            let id = entity_id(arg(args, 2, "entity id")?)?;
-            let tags = tags(&args[3..])?;
-            let mut vol = volume(path)?;
-            let mut tx = vol.begin(&());
-            let copy = tx.copy(&id, None, tags).map_err(err)?;
-            tx.commit().map_err(err)?;
-            say!("{copy}");
+            let id = entity_id(arg(args, 1, "entity id")?)?;
+            let ids = vol.apply(vec![Op::Copy { from: id, unit: None, tags: tags(&args[2..])? }])?;
+            say!("{}", ids[0].ok_or("no id returned")?);
         }
         "rm" => {
-            let mut vol = volume(path)?;
-            let mut tx = vol.begin(&());
-            for a in rest {
-                tx.delete(&entity_id(a)?).map_err(err)?;
-            }
-            tx.commit().map_err(err)?;
+            let ops = rest.iter().map(|a| entity_id(a).map(|id| Op::Delete { id })).collect::<Result<_, _>>()?;
+            vol.apply(ops)?;
         }
         other => return Err(format!("unknown command {other:?}\n\n{USAGE}")),
     }
-    Ok(())
-}
-
-fn info(path: &str) -> Result<(), String> {
-    let unit = open(path)?;
-    say!("unit        {}", hex(&unit.id().0));
-    say!("entities    {}", unit.snapshot().all().map_err(err)?.len());
-    Ok(())
-}
-
-fn check(path: &str) -> Result<(), String> {
-    open(path)?.check().map_err(err)?;
-    say!("ok");
     Ok(())
 }

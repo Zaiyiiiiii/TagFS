@@ -1,0 +1,18 @@
+[package]
+name = "tagfs-volume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "运行中的 TagFS 卷：持有单元、让它们上线和离线、执行读写和查询，经本机套接字提供给各工具"
+
+[[bin]]
+name = "tagfs-volume"
+path = "src/main.rs"
+
+[dependencies]
+interprocess = "2"
+tagfs = { path = "../tagfs" }
+tagfs-proto = { path = "../tagfs-proto" }
+
+[lints]
+workspace = true
