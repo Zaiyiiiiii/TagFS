@@ -1,0 +1,16 @@
+[package]
+name = "tagfs-device-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的宿主机块设备：单个文件或裸盘"
+
+[dependencies]
+tagfs-device = { path = "../tagfs-device" }
+
+[dev-dependencies]
+tagfs-block = { path = "../tagfs-block" }
+tagfs-core = { path = "../tagfs-core" }
+
+[lints]
+workspace = true

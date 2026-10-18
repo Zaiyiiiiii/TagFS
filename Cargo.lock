@@ -17,3 +17,12 @@ version = "0.1.0"
 [[package]]
 name = "tagfs-device"
 version = "0.1.0"
+
+[[package]]
+name = "tagfs-device-host"
+version = "0.1.0"
+dependencies = [
+ "tagfs-block",
+ "tagfs-core",
+ "tagfs-device",
+]
