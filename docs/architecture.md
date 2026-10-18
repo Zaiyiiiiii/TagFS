@@ -325,7 +325,7 @@ Cargo workspace：
 | `tagfs-backend-disk` | 裸盘后端：块格式单元直接放在整块盘或分区上；自带工具 `tagfs-disk`：格式化 | `std`、`tagfs-block`、`tagfs-device-host` |
 | `tagfs-backend-hostdir` | 宿主目录后端（路径目录兼容层），映射 `tagfs:hostfs_path`；自带工具 `tagfs-hostdir`：在宿主目录上建目录单元、全量对账 | `std`、`tagfs-core`、`tagfs-backend-file`（存放没有路径的实体的镜像文件） |
 | `tagfs` | 对外 API，组合以上各层：各后端、系统时钟和随机数的身份来源、查询游标 | 以上全部 |
-| `tagfs-tools` | 通用命令行工具 `tagfs`：对任何单元做一致性检查、查看信息、查找实体、读写内容和 Tag。建单元由各后端自己的工具负责 | `std` |
+| `tagfs-tools` | 通用命令行工具 `tagfs`：一致性检查、单元身份和实体数、查找实体、读写内容和 Tag。只通过统一的单元接口工作，不区分后端：单元由认得它的后端打开（各后端提供识别），检查由单元自己实现。各后端只在建立单元时不同，建立和后端特有的信息由各后端自己的工具负责 | `std` |
 
 逻辑层、块格式、设备接口和内存后端不依赖 `std`，将来脱离宿主运行在裸机上时，只需要换设备实现。
 

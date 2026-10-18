@@ -55,6 +55,13 @@ pub fn open(device: impl AsRef<Path>) -> Result<DiskUnit, DiskError> {
     Ok(BlockUnit::open(FileDevice::open(device, BLOCK_SIZE, false)?)?)
 }
 
+/// `device` 是不是格式化过的盘：一个设备（不是普通文件或目录），上面是块格式单元。只读，不改。
+pub fn recognizes(device: impl AsRef<Path>) -> bool {
+    let device = device.as_ref();
+    std::fs::metadata(device).is_ok_and(|m| !m.is_file() && !m.is_dir())
+        && FileDevice::open(device, BLOCK_SIZE, true).is_ok_and(|d| tagfs_block::is_formatted(&d))
+}
+
 #[cfg(test)]
 mod tests {
     use tagfs_core::{Change, EntityId, Unit, UnitId};

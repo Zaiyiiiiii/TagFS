@@ -202,6 +202,20 @@ impl Unit for MemUnit {
         self.state = Arc::new(next);
         Ok(())
     }
+
+    /// 引用数和引用它的实体数一致，没有悬空的对象。
+    fn check(&mut self) -> Result<(), UnitError> {
+        let mut refs: BTreeMap<u64, u64> = BTreeMap::new();
+        for (_, object) in self.state.entities.values() {
+            *refs.entry(*object).or_default() += 1;
+        }
+        let consistent = refs.len() == self.state.objects.len()
+            && self.state.objects.iter().all(|(o, (_, n))| refs.get(o) == Some(n));
+        if !consistent {
+            return Err(UnitError::Corrupt);
+        }
+        Ok(())
+    }
 }
 
 struct MemSnapshot(Arc<State>);

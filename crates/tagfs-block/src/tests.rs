@@ -193,6 +193,8 @@ fn format_and_reopen_an_empty_unit() {
 
 #[test]
 fn rejects_what_it_cannot_use() {
+    assert!(!crate::is_formatted(&mem_device(64)));
+    assert!(crate::is_formatted(&*fresh(64).device()));
     assert_eq!(BlockUnit::open(mem_device(64)).err(), Some(OpenError::NotFormatted));
     assert_eq!(BlockUnit::format(MemDevice::new(64 * 512, 512), UNIT).err(), Some(OpenError::BadBlockSize));
     assert_eq!(BlockUnit::format(mem_device(4), UNIT).err(), Some(OpenError::TooSmall));

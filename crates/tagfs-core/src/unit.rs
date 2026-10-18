@@ -159,6 +159,9 @@ pub trait Unit {
 
     /// 清掉“已提交”记录。卷确认所有参与单元都完成后调用。
     fn forget(&mut self, txn: TxnId) -> Result<(), UnitError>;
+
+    /// 一致性检查，怎么查由单元自己决定。发现问题返回 [`UnitError::Corrupt`] 或别的错误。
+    fn check(&mut self) -> Result<(), UnitError>;
 }
 
 /// 已提交状态的只读视图。存储单元的读取可能失败（设备出错、校验不通过），

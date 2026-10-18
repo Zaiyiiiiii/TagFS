@@ -9,7 +9,8 @@ const USAGE: &str = "\
 用法：tagfs-hostdir <命令> <目录>
 
   init <目录>   在已有的宿主目录上建目录单元，把里面的文件映射成实体
-  scan <目录>   和宿主目录全量对账，报告新增、删除、改名的文件";
+  scan <目录>   和宿主目录全量对账，报告新增、删除、改名的文件
+  info <目录>   映射了多少文件、是否实时同步、镜像文件的空间情况";
 
 /// 系统时钟加系统随机数。
 struct SystemIds;
@@ -44,6 +45,19 @@ fn main() -> ExitCode {
                 "{} added, {} removed, {} renamed, {} skipped",
                 report.added, report.removed, report.renamed, report.skipped
             );
+        }),
+        "info" => DirUnit::open(dir, Box::new(SystemIds)).map(|(unit, _)| {
+            use tagfs_core::{Key, Namespace, Probe, Unit};
+            let (ns, key) = (Namespace::tagfs(), Key::new(tagfs_backend_hostdir::HOSTFS_PATH));
+            let snap = unit.snapshot();
+            let all = snap.all().map(|a| a.len()).unwrap_or(0);
+            let files = snap.probe(&Probe::Has { ns: &ns, key: &key }).ok().flatten().map_or(0, |f| f.len());
+            let image = unit.image();
+            println!("root        {}", unit.root().display());
+            println!("unit        {}", unit.id().0.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            println!("entities    {all} ({files} files in the directory, {} in the image)", all - files);
+            println!("live sync   {}", if unit.is_live() { "yes" } else { "no" });
+            println!("image       {} bytes, {} free", image.total_blocks() * 4096, image.free_blocks() * 4096);
         }),
         _ => {
             println!("{USAGE}");

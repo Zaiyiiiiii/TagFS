@@ -566,6 +566,18 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
     }
 }
 
+/// 设备上是不是块格式单元（至少有一份超级块校验通过，格式版本不论）。只读，不改设备。
+pub fn is_formatted<D: BlockDevice + ?Sized>(dev: &D) -> bool {
+    let bs = dev.block_size();
+    if bs < MIN_BLOCK_SIZE || !bs.is_power_of_two() {
+        return false;
+    }
+    (0..2).any(|slot| {
+        tree::read_block(dev, slot, bs as usize)
+            .is_ok_and(|buf| !matches!(Super::decode(&buf), Err(OpenError::NotFormatted)))
+    })
+}
+
 fn alloc_one(free: &mut ExtentSet, fresh: &mut ExtentSet) -> Result<u64, UnitError> {
     let (b, _) = free.take(1).ok_or(UnitError::NoSpace)?;
     fresh.insert(b, 1);
@@ -651,6 +663,10 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
 
     fn forget(&mut self, txn: TxnId) -> Result<(), UnitError> {
         self.update(|w| w.remove_committed(&txn))
+    }
+
+    fn check(&mut self) -> Result<(), UnitError> {
+        self.verify()
     }
 }
 

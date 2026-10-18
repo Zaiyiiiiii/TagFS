@@ -59,6 +59,12 @@ pub fn open(path: impl AsRef<Path>) -> Result<ImageUnit, ImageError> {
     Ok(BlockUnit::open(FileDevice::open(path, BLOCK_SIZE, false)?)?)
 }
 
+/// `path` 是不是镜像文件：一个普通文件，里面是块格式单元。只读，不改。
+pub fn recognizes(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.is_file() && FileDevice::open(path, BLOCK_SIZE, true).is_ok_and(|d| tagfs_block::is_formatted(&d))
+}
+
 #[cfg(test)]
 mod tests {
     use tagfs_core::{Change, EntityId, Tag, Unit};

@@ -1208,6 +1208,18 @@ impl Unit for DirUnit {
     fn forget(&mut self, txn: TxnId) -> Result<(), UnitError> {
         self.inner.get_mut().image.forget(txn)
     }
+
+    /// 先和宿主目录全量对账，再检查镜像。
+    fn check(&mut self) -> Result<(), UnitError> {
+        self.rescan()?;
+        self.inner.get_mut().image.verify()
+    }
+}
+
+/// `path` 是不是目录单元的挂载目录。只看，不改。
+pub fn recognizes(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.is_dir() && path.join(RESERVED).join(IMAGE).is_file()
 }
 
 /// 路径实体的长度和内容直接取自宿主文件的当前状态。

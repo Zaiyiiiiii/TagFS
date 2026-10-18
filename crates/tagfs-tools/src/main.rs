@@ -1,21 +1,22 @@
 //! `tagfs` 命令行工具：管理员视角操作单个存储单元，不设可见性和权限限制。
+//!
+//! 它只通过统一的单元接口工作，不区分单元是哪种后端。各后端只在建立单元时不同，那由各自的工具负责。
 
 mod syntax;
 
 use std::fmt::Display;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::process::ExitCode;
 
-use tagfs::{DirUnit, EntityId, ImageUnit, Query, SystemIds, Tag, Unit, Unrestricted, Volume};
+use tagfs::{EntityId, SystemIds, Tag, Unit, Unrestricted, Volume};
 
 const USAGE: &str = "\
 用法：tagfs <命令> <单元> [参数...]
 
-<单元> 是单文件单元（镜像文件或裸盘）或目录单元的目录。
+<单元> 是任意一种存储单元所在的位置（由认得它的后端打开）。
 
-  info <单元>                    单元信息
-  check <单元>                   一致性检查（目录单元同时和目录对账）
+  info <单元>                    单元身份和实体数
+  check <单元>                   一致性检查
   find <单元> [条件...]          查找满足条件的实体，列出 ID、长度、Tag
   show <单元> <ID>               实体的 Tag 和长度
   cat <单元> <ID>                实体内容写到标准输出
@@ -26,8 +27,7 @@ const USAGE: &str = "\
 
 Tag：ns:key（无值）、ns:key=文本、ns:key=#123（uint）。
 条件：ns:key（带这个键）、ns:key=值、ns:key^=前缀、ns:key>=值（还有 > <= <），前加 ! 取反，多个条件取“且”。
-单元由各后端自己的工具建立：单文件单元用 tagfs-file，目录单元用 tagfs-hostdir。
-在目录单元里，tagfs:hostfs_path=/路径 就是文件在目录里的位置，增删改它就是建、删、移动文件。";
+单元由各后端自己的工具建立（tagfs-file、tagfs-disk、tagfs-hostdir），后端特有的信息也在那里查看。";
 
 /// 写一行到标准输出。写不进去时返回错误（见 [`io_out`]），不像 `println!` 那样崩溃。
 macro_rules! say {
@@ -61,27 +61,13 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-enum Opened {
-    Image(ImageUnit),
-    Dir(DirUnit),
-}
-
-fn open(path: &str) -> Result<Opened, String> {
-    if Path::new(path).is_dir() {
-        let (unit, _) = DirUnit::open(path, Box::new(SystemIds)).map_err(err)?;
-        Ok(Opened::Dir(unit))
-    } else {
-        Ok(Opened::Image(tagfs::image::open(path).map_err(err)?))
-    }
+fn open(path: &str) -> Result<Box<dyn Unit>, String> {
+    tagfs::open_unit(path).map_err(|e| format!("{path}: {e}"))
 }
 
 fn volume(path: &str) -> Result<Volume<Unrestricted>, String> {
-    let unit: Box<dyn Unit> = match open(path)? {
-        Opened::Image(u) => Box::new(u),
-        Opened::Dir(u) => Box::new(u),
-    };
     let mut vol = Volume::new(Unrestricted, Box::new(SystemIds));
-    vol.attach(unit).map_err(err)?;
+    vol.attach(open(path)?).map_err(err)?;
     Ok(vol)
 }
 
@@ -206,64 +192,15 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn count(unit: &dyn Unit, query: &Query) -> Result<usize, String> {
-    let snap = unit.snapshot();
-    let all = snap.all().map_err(err)?;
-    let mut n = 0;
-    for id in all {
-        if let Some(r) = snap.get(&id).map_err(err)?
-            && query.matches(&r.tags)
-        {
-            n += 1;
-        }
-    }
-    Ok(n)
-}
-
-fn print_image(image: &ImageUnit) -> Result<(), String> {
-    let bs = tagfs::BLOCK_SIZE as u64;
-    say!("generation  {}", image.generation());
-    say!("size        {} bytes ({} blocks)", image.total_blocks() * bs, image.total_blocks());
-    say!("free        {} bytes", image.free_blocks() * bs);
-    Ok(())
-}
-
 fn info(path: &str) -> Result<(), String> {
-    let has_path = Query::has("tagfs", tagfs::hostdir::HOSTFS_PATH);
-    match open(path)? {
-        Opened::Image(unit) => {
-            say!("kind        single-file unit");
-            say!("unit        {}", hex(&unit.id().0));
-            say!("entities    {}", count(&unit, &Query::All)?);
-            print_image(&unit)?;
-        }
-        Opened::Dir(unit) => {
-            say!("kind        directory unit");
-            say!("root        {}", unit.root().display());
-            say!("unit        {}", hex(&unit.id().0));
-            say!("entities    {} ({} files in the directory)", count(&unit, &Query::All)?, count(&unit, &has_path)?);
-            say!("live sync   {}", if unit.is_live() { "yes" } else { "no" });
-            print_image(&unit.image())?;
-        }
-    }
+    let unit = open(path)?;
+    say!("unit        {}", hex(&unit.id().0));
+    say!("entities    {}", unit.snapshot().all().map_err(err)?.len());
     Ok(())
 }
 
 fn check(path: &str) -> Result<(), String> {
-    match open(path)? {
-        Opened::Image(unit) => unit.verify().map_err(err)?,
-        Opened::Dir(mut unit) => {
-            let report = unit.rescan().map_err(err)?;
-            say!(
-                "reconciled: {} added, {} removed, {} renamed, {} skipped",
-                report.added,
-                report.removed,
-                report.renamed,
-                report.skipped
-            );
-            unit.image().verify().map_err(err)?;
-        }
-    }
+    open(path)?.check().map_err(err)?;
     say!("ok");
     Ok(())
 }

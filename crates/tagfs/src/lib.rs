@@ -47,6 +47,8 @@ pub const BLOCK_SIZE: u32 = tagfs_backend_file::BLOCK_SIZE;
 /// 打开或新建存储单元时的错误。
 #[derive(Debug)]
 pub enum UnitOpenError {
+    /// 没有哪个后端认得这个路径上的东西。
+    Unrecognized,
     Io(io::Error),
     Block(OpenError),
     Dir(DirError),
@@ -91,6 +93,7 @@ impl From<DirError> for UnitOpenError {
 impl std::fmt::Display for UnitOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UnitOpenError::Unrecognized => f.write_str("not a TagFS unit"),
             UnitOpenError::Io(e) => write!(f, "{e}"),
             UnitOpenError::Block(e) => write!(f, "{e}"),
             UnitOpenError::Dir(e) => write!(f, "{e}"),
@@ -120,17 +123,19 @@ pub fn new_unit_id() -> UnitId {
     UnitId(b)
 }
 
-/// 打开 `path` 上已有的单元：目录按宿主目录单元打开，文件按单文件单元打开，设备按裸盘单元打开。
+/// 打开 `path` 上已有的单元：依次问各后端是否认得它，由认得的后端打开。调用者拿到的都是 [`Unit`]，
+/// 之后的使用和单元种类无关。
 pub fn open_unit(path: impl AsRef<Path>) -> Result<Box<dyn Unit>, UnitOpenError> {
     let path = path.as_ref();
-    let meta = std::fs::metadata(path)?;
-    if meta.is_dir() {
+    if hostdir::recognizes(path) {
         let (unit, _) = DirUnit::open(path, Box::new(SystemIds))?;
         Ok(Box::new(unit))
-    } else if meta.is_file() {
+    } else if image::recognizes(path) {
         Ok(Box::new(image::open(path)?))
-    } else {
+    } else if disk::recognizes(path) {
         Ok(Box::new(disk::open(path)?))
+    } else {
+        Err(UnitOpenError::Unrecognized)
     }
 }
 
@@ -234,6 +239,24 @@ mod tests {
             seen.extend(page);
         }
         assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn units_are_opened_by_the_backend_that_recognises_them() {
+        let base = std::env::temp_dir().join(format!("tagfs-facade-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+        std::fs::create_dir_all(base.join("mapped")).unwrap();
+        std::fs::write(base.join("not-a-unit"), b"hello").unwrap();
+        image::create(base.join("u.img"), UnitId([1; 16])).unwrap();
+        DirUnit::create(base.join("mapped"), UnitId([2; 16]), Box::new(SystemIds)).unwrap();
+
+        assert_eq!(open_unit(base.join("u.img")).unwrap().id(), UnitId([1; 16]));
+        assert_eq!(open_unit(base.join("mapped")).unwrap().id(), UnitId([2; 16]));
+        for nothing in ["plain", "not-a-unit", "missing"] {
+            assert!(matches!(open_unit(base.join(nothing)), Err(UnitOpenError::Unrecognized)), "{nothing}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
