@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "TagFS 的块设备接口与内存实现"
 
+[dependencies]
+tagfs-sync = { path = "../tagfs-sync" }
+
 [lints]
 workspace = true

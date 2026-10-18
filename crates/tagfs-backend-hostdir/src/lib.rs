@@ -2,28 +2,30 @@
 //! 那里按路径组织的文件。
 //!
 //! - 挂载目录就是根 `/`。其中的每个普通文件是一个实体，带 `tagfs:hostfs_path`，值是它以挂载目录为根的
-//!   路径；内容就是那个文件，读写都直接对文件进行。目录不是实体。符号链接不映射，也不会被跟随。
+//!   路径；内容就是那个文件，读写都直接对文件进行（Tag 只负责找到文件）。目录不是实体。
+//!   符号链接不映射，也不会被跟随。
 //! - `tagfs:hostfs_path` 是映射出来的：加上它就在宿主上建出文件（缺的上层目录一并建出），
 //!   改它就移动文件，去掉它或删除实体就删掉宿主文件。
 //! - 没有路径的实体存在挂载目录下的镜像文件里（`/.tagfs/unit.img`，块格式），和别的单元一样。
 //!   镜像文件同时存放全部实体的 Tag 和索引，以及目录单元自己的记录。镜像文件按需扩容。
 //! - 宿主上的改动（建、删、改名、改内容）通过文件系统通知实时同步过来；挂载时还会全量对账一次。
+//! - 暂存的内容放在宿主上的暂存文件里（`/.tagfs/staged/`）：新实体带路径时直接改名过去，不复制；
+//!   不带路径时才搬进镜像。
 //!
-//! 一次修改分两步提交，中间做宿主上的文件操作：
+//! 元数据的一次修改分两步提交，中间做宿主上的文件操作：
 //!
 //! 1. 镜像里提交实体的修改，同时记下要做的宿主操作（意图记录）。这是提交点。
-//! 2. 按意图记录操作宿主：对路径实体的写入直接写进宿主文件；要复制的文件在宿主上复制；
-//!    再把要让出的文件挪进 `/.tagfs/tmp`，最后把各文件放到新路径。
+//! 2. 按意图记录操作宿主：要复制的文件在宿主上复制；再把要让出的文件挪进 `/.tagfs/tmp`，
+//!    最后把各文件放到新路径。
 //! 3. 镜像里再提交一次：删掉意图记录，记下文件身份。
 //!
 //! 之后断电，挂载时按意图记录把第 2、3 步做完：宿主操作都可以重做。
 //!
-//! 只有内容要换个地方存放时才会搬运整个文件：路径实体失去路径（内容进镜像）、被复制成没有路径的实体，
-//! 或者镜像里的实体加上路径（内容写到宿主）。这些都是分段流式进行的，不会整个读进内存。
+//! 只有内容要换个地方存放时才会搬运整个文件：路径实体失去路径（内容进镜像）、从路径实体复制出没有路径的
+//! 实体，或者镜像里的实体加上路径（内容写到宿主）。这些都是分段流式进行的，不会整个读进内存。
 
 mod path;
 
-use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -31,11 +33,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use tagfs_backend_file::{ImageError, ImageUnit};
-use tagfs_block::{Aux, Batch, Fill, OpenError, Source};
+use tagfs_block::{Aux, Batch, OpenError};
 use tagfs_core::{
-    Change, EntityId, EntityRecord, IdSource, Key, Namespace, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError,
-    UnitId, Value,
+    Change, EntityId, EntityRecord, IdSource, Key, Namespace, Probe, Snapshot, StageId, Tag, TxnId, TxnInfo, Unit,
+    UnitError, UnitId, Value,
 };
+use tagfs_sync::Mutex;
 
 pub use path::{HostPath, INVALID_PATH, PATH_TAKEN, RESERVED};
 
@@ -47,8 +50,9 @@ pub const HOSTFS_PATH: &str = "hostfs_path";
 
 const IMAGE: &str = "unit.img";
 const TMP: &str = "tmp";
-/// 第 2 步里“直接写入和复制”已经做完的标记。
-const EDITED: &str = "edited";
+const STAGED: &str = "staged";
+/// 第 2 步里“宿主上的复制”已经做完的标记。
+const COPIED: &str = "copied";
 /// 第 2 步里“让出旧文件”已经做完的标记。
 const PARKED: &str = "parked";
 /// 流式搬运内容时一次读写多少。
@@ -290,13 +294,6 @@ fn identity_key(id: &EntityId) -> Vec<u8> {
 
 // ---- 意图记录 ----
 
-/// 对路径实体内容的直接修改。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Edit {
-    Write { offset: u64, data: Vec<u8> },
-    Truncate { len: u64 },
-}
-
 /// 实体的文件最后放到新路径时，内容从哪来。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Place {
@@ -308,6 +305,8 @@ enum Place {
     Staged,
     /// 原来的文件（挪进临时目录后）改名过去。
     Parked,
+    /// 暂存文件改名过去。
+    FromStage(StageId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,9 +323,7 @@ struct Item {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Intent {
-    /// 直接写进宿主文件的修改，按顺序：实体、它的文件、修改。
-    edits: Vec<(EntityId, HostPath, Edit)>,
-    /// 宿主上的复制：新实体、源文件。在全部直接修改之后做。
+    /// 宿主上的复制：新实体、源文件。在让出旧文件之前做。
     copies: Vec<(EntityId, HostPath)>,
     items: Vec<Item>,
 }
@@ -395,27 +392,11 @@ impl<'a> Dec<'a> {
 
 impl Intent {
     fn is_empty(&self) -> bool {
-        self.edits.is_empty() && self.copies.is_empty() && self.items.is_empty()
+        self.copies.is_empty() && self.items.is_empty()
     }
 
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc(Vec::new());
-        e.u64(self.edits.len() as u64);
-        for (id, p, edit) in &self.edits {
-            e.id(id);
-            e.path(&Some(p.clone()));
-            match edit {
-                Edit::Write { offset, data } => {
-                    e.u8(0);
-                    e.u64(*offset);
-                    e.bytes(data);
-                }
-                Edit::Truncate { len } => {
-                    e.u8(1);
-                    e.u64(*len);
-                }
-            }
-        }
         e.u64(self.copies.len() as u64);
         for (id, src) in &self.copies {
             e.id(id);
@@ -426,12 +407,16 @@ impl Intent {
             e.id(&it.id);
             e.path(&it.old);
             e.path(&it.new);
-            e.u8(match it.place {
-                Place::Nothing => 0,
-                Place::Image => 1,
-                Place::Staged => 2,
-                Place::Parked => 3,
-            });
+            match it.place {
+                Place::Nothing => e.u8(0),
+                Place::Image => e.u8(1),
+                Place::Staged => e.u8(2),
+                Place::Parked => e.u8(3),
+                Place::FromStage(s) => {
+                    e.u8(4);
+                    e.u64(s.0);
+                }
+            }
             e.u8(it.vacate as u8);
         }
         e.0
@@ -440,16 +425,6 @@ impl Intent {
     fn decode(b: &[u8]) -> Result<Intent, UnitError> {
         let mut d = Dec(b);
         let mut intent = Intent::default();
-        for _ in 0..d.u64()? {
-            let id = d.id()?;
-            let p = d.path()?.ok_or(UnitError::Corrupt)?;
-            let edit = match d.u8()? {
-                0 => Edit::Write { offset: d.u64()?, data: d.bytes()?.to_vec() },
-                1 => Edit::Truncate { len: d.u64()? },
-                _ => return Err(UnitError::Corrupt),
-            };
-            intent.edits.push((id, p, edit));
-        }
         for _ in 0..d.u64()? {
             let id = d.id()?;
             intent.copies.push((id, d.path()?.ok_or(UnitError::Corrupt)?));
@@ -463,6 +438,7 @@ impl Intent {
                 1 => Place::Image,
                 2 => Place::Staged,
                 3 => Place::Parked,
+                4 => Place::FromStage(StageId(d.u64()?)),
                 _ => return Err(UnitError::Corrupt),
             };
             intent.items.push(Item { id, old, new, place, vacate: d.u8()? != 0 });
@@ -473,23 +449,17 @@ impl Intent {
 
 /// 一组修改在目录单元上的执行计划。
 struct Plan {
-    /// 内容要搬进镜像的路径实体和它的文件。
+    /// 失去路径的路径实体和它的文件：内容搬进镜像。
     hydrate: Vec<(EntityId, HostPath)>,
-    /// 交给镜像的修改（对直接写宿主的实体，内容修改不进镜像）。
-    changes: Vec<Change>,
+    /// 从路径实体复制、自己最后没有路径的新实体：第几项修改、源文件。内容从源文件搬进镜像。
+    copy_in: Vec<(usize, HostPath)>,
+    /// 内容要从暂存文件搬进镜像的暂存（实体最后没有路径，或者同一批里还要从它复制）。
+    stage_in: Vec<StageId>,
+    /// 暂存文件直接改名到新路径的暂存。
+    stage_out: Vec<StageId>,
+    /// 这一批用到的其余暂存：提交之后宿主上的暂存文件就没用了。
+    stage_done: Vec<StageId>,
     intent: Intent,
-}
-
-/// 把宿主文件当作内容来源，分段读取。
-struct HostSource(Option<fs::File>);
-
-impl Source for HostSource {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError> {
-        match &self.0 {
-            Some(f) => read_at(f, offset, buf).map_err(io_err),
-            None => Ok(0),
-        }
-    }
 }
 
 // ---- 单元 ----
@@ -497,24 +467,23 @@ impl Source for HostSource {
 /// 需要对账的范围：挂载目录下的若干路径（按段），空表示整个目录。
 type Scope = Vec<String>;
 
-struct Inner {
-    root: PathBuf,
-    image: ImageUnit,
-    ids: Box<dyn IdSource>,
-}
-
 struct Watch {
     // 只为持有：放掉它就停止监听。
     _watcher: notify::RecommendedWatcher,
-    events: mpsc::Receiver<notify::Result<notify::Event>>,
+    events: Mutex<mpsc::Receiver<notify::Result<notify::Event>>>,
 }
 
 pub struct DirUnit {
     root: PathBuf,
-    inner: RefCell<Inner>,
+    image: ImageUnit,
+    ids: Mutex<Box<dyn IdSource + Send>>,
+    /// 元数据修改和对账一次一个：它们都会搬动宿主上的文件。内容读写不用它。
+    meta: Mutex<()>,
     watch: Option<Watch>,
     /// 取快照前同步失败的错误，下一个能报错的调用把它报出来。
-    sync_error: Cell<Option<UnitError>>,
+    sync_error: Mutex<Option<UnitError>>,
+    /// 写过、还没落盘的宿主文件。
+    dirty: Mutex<BTreeSet<HostPath>>,
 }
 
 impl DirUnit {
@@ -522,7 +491,7 @@ impl DirUnit {
     pub fn create(
         root: impl AsRef<Path>,
         unit: UnitId,
-        ids: Box<dyn IdSource>,
+        ids: Box<dyn IdSource + Send>,
     ) -> Result<(Self, ScanReport), DirError> {
         let root = fs::canonicalize(root)?;
         if !fs::metadata(&root)?.is_dir() {
@@ -539,7 +508,7 @@ impl DirUnit {
     }
 
     /// 挂载已有的目录单元：完成断电前没做完的宿主操作，再和目录对账。
-    pub fn open(root: impl AsRef<Path>, ids: Box<dyn IdSource>) -> Result<(Self, ScanReport), DirError> {
+    pub fn open(root: impl AsRef<Path>, ids: Box<dyn IdSource + Send>) -> Result<(Self, ScanReport), DirError> {
         let root = fs::canonicalize(root)?;
         let img = root.join(RESERVED).join(IMAGE);
         if !img.is_file() {
@@ -549,18 +518,26 @@ impl DirUnit {
         Self::start(root, image, ids)
     }
 
-    fn start(root: PathBuf, image: ImageUnit, ids: Box<dyn IdSource>) -> Result<(Self, ScanReport), DirError> {
+    fn start(root: PathBuf, image: ImageUnit, ids: Box<dyn IdSource + Send>) -> Result<(Self, ScanReport), DirError> {
         // 先开始监听，再对账：对账期间发生的改动不会漏掉。
         let watch = start_watch(&root);
-        let mut inner = Inner { root: root.clone(), image, ids };
-        if let Some(raw) = inner.image.aux_get(AUX_INTENT)? {
+        let me = DirUnit {
+            root,
+            image,
+            ids: Mutex::new(ids),
+            meta: Mutex::new(()),
+            watch,
+            sync_error: Mutex::new(None),
+            dirty: Mutex::new(BTreeSet::new()),
+        };
+        if let Some(raw) = me.image.aux_get(AUX_INTENT)? {
             let intent = Intent::decode(&raw)?;
-            inner.carry_out(&intent)?;
-            inner.finish(&intent)?;
+            me.carry_out(&intent)?;
+            me.finish(&intent)?;
         }
-        inner.clean_tmp()?;
-        let report = inner.reconcile(None)?;
-        let me = DirUnit { root, inner: RefCell::new(inner), watch, sync_error: Cell::new(None) };
+        me.clean_tmp()?;
+        me.clean_staged()?;
+        let report = me.reconcile(None)?;
         Ok((me, report))
     }
 
@@ -574,35 +551,40 @@ impl DirUnit {
     }
 
     /// 镜像（块格式单元），检查用。
-    pub fn image(&self) -> Ref<'_, ImageUnit> {
-        Ref::map(self.inner.borrow(), |i| &i.image)
+    pub fn image(&self) -> &ImageUnit {
+        &self.image
     }
 
     /// 全量对账。
-    pub fn rescan(&mut self) -> Result<ScanReport, UnitError> {
+    pub fn rescan(&self) -> Result<ScanReport, UnitError> {
         self.drain_events();
-        self.inner.get_mut().reconcile(None)
+        let _one = self.meta.lock();
+        self.reconcile(None)
     }
 
     /// 把收到的宿主改动通知同步进来。
-    pub fn sync(&self) -> Result<ScanReport, UnitError> {
-        if let Some(e) = self.sync_error.take() {
+    pub fn refresh(&self) -> Result<ScanReport, UnitError> {
+        if let Some(e) = self.sync_error.lock().take() {
             return Err(e);
         }
         match self.drain_events() {
             None => Ok(ScanReport::default()),
-            Some(scopes) => self.inner.borrow_mut().reconcile(scopes.map(|s| s.into_iter().collect())),
+            Some(scopes) => {
+                let _one = self.meta.lock();
+                self.reconcile(scopes.map(|s| s.into_iter().collect()))
+            }
         }
     }
 
     /// 取出全部待处理的通知，合并成对账范围。没有通知时为 `None`；`Some(None)` 表示要全量对账。
     fn drain_events(&self) -> Option<Option<BTreeSet<Scope>>> {
         let watch = self.watch.as_ref()?;
+        let events = watch.events.lock();
         let mut scopes = BTreeSet::new();
         let mut full = false;
         let mut any = false;
         loop {
-            match watch.events.try_recv() {
+            match events.try_recv() {
                 Ok(Ok(ev)) => {
                     any = true;
                     full |= ev.need_rescan();
@@ -645,33 +627,12 @@ impl DirUnit {
         Some(Some(kept.into_iter().collect()))
     }
 
-    fn sync_mut(&mut self) -> Result<(), UnitError> {
-        self.sync().map(|_| ())
-    }
-}
-
-fn start_watch(root: &Path) -> Option<Watch> {
-    use notify::Watcher;
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(tx).ok()?;
-    watcher.watch(root, notify::RecursiveMode::Recursive).ok()?;
-    Some(Watch { _watcher: watcher, events: rx })
-}
-
-/// 宿主上的绝对路径在挂载目录下的各段。不在挂载目录下或名字不是 UTF-8 时为 `None`。
-fn scope_of(root: &Path, p: &Path) -> Option<Scope> {
-    let rel = p.strip_prefix(root).ok()?;
-    rel.components()
-        .map(|c| match c {
-            std::path::Component::Normal(s) => s.to_str().map(String::from),
-            _ => None,
-        })
-        .collect()
-}
-
-impl Inner {
     fn tmp(&self) -> PathBuf {
         self.root.join(RESERVED).join(TMP)
+    }
+
+    fn staged_file(&self, s: StageId) -> PathBuf {
+        self.root.join(RESERVED).join(STAGED).join(s.0.to_string())
     }
 
     fn clean_tmp(&self) -> Result<(), UnitError> {
@@ -682,8 +643,84 @@ impl Inner {
         }
     }
 
-    /// 范围内的宿主文件和镜像对账。`scopes` 为 `None` 时是整个目录。
-    fn reconcile(&mut self, scopes: Option<BTreeSet<Scope>>) -> Result<ScanReport, UnitError> {
+    /// 镜像里已经没有对应暂存的暂存文件：上次没用上就断了，删掉。
+    fn clean_staged(&self) -> Result<(), UnitError> {
+        let live: BTreeSet<String> = self.image.stages()?.iter().map(|s| s.0.to_string()).collect();
+        let entries = match fs::read_dir(self.root.join(RESERVED).join(STAGED)) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(e)),
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_str().is_some_and(|n| live.contains(n)) {
+                fs::remove_file(entry.path()).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_staged_file(&self, s: StageId) -> Result<(), UnitError> {
+        match fs::remove_file(self.staged_file(s)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// 暂存文件落盘（准备记录或意图记录要引用它之前）。
+    fn sync_staged_file(&self, s: StageId) -> Result<(), UnitError> {
+        match fs::File::open(self.staged_file(s)) {
+            Ok(f) => f.sync_all().map_err(io_err),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(UnitError::UnknownStage(s)),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// 路径实体的宿主文件，打开来写。文件在宿主上不见了就当实体不存在（对账时它会被删掉）。
+    fn open_host(&self, id: &EntityId, p: &HostPath) -> Result<fs::File, UnitError> {
+        match p.inspect(&self.root)? {
+            Some(m) if m.is_file() => fs::OpenOptions::new().write(true).open(p.on_host(&self.root)).map_err(io_err),
+            _ => Err(UnitError::NotFound(*id)),
+        }
+    }
+
+    /// 实体当前的映射路径；不存在时报错。
+    fn located(&self, id: &EntityId) -> Result<Option<HostPath>, UnitError> {
+        self.refresh()?;
+        let rec = self.image.snapshot().get(id)?.ok_or(UnitError::NotFound(*id))?;
+        path_of(&rec.tags)
+    }
+
+    /// 把 `from`（不存在就当空的）的内容分段写进镜像里的暂存。
+    fn stream_in(&self, from: Option<PathBuf>, stage: StageId) -> Result<(), UnitError> {
+        let Some(from) = from else { return Ok(()) };
+        let f = match fs::File::open(from) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(e)),
+        };
+        let mut buf = vec![0u8; CHUNK];
+        let mut offset = 0u64;
+        loop {
+            let n = read_at(&f, offset, &mut buf).map_err(io_err)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.image.write_staged(stage, offset, &buf[..n])?;
+            offset += n as u64;
+        }
+    }
+
+    /// 路径实体在宿主上的文件（经过符号链接检查）；不存在为 `None`。
+    fn host_file(&self, p: &HostPath) -> Result<Option<PathBuf>, UnitError> {
+        Ok(match p.inspect(&self.root)? {
+            Some(m) if m.is_file() => Some(p.on_host(&self.root)),
+            _ => None,
+        })
+    }
+
+    /// 范围内的宿主文件和镜像对账。`scopes` 为 `None` 时是整个目录。调用者持有 `meta`。
+    fn reconcile(&self, scopes: Option<BTreeSet<Scope>>) -> Result<ScanReport, UnitError> {
         let mut report = ScanReport::default();
         let mut found: BTreeMap<HostPath, Ident> = BTreeMap::new();
         match &scopes {
@@ -767,13 +804,13 @@ impl Inner {
             }
         }
         for (p, ident) in found {
-            let id = EntityId::generate(&mut *self.ids);
-            changes.push(Change::Create { id, tags: vec![path_tag(&p)], content: Vec::new() });
+            let id = EntityId::generate(&mut **self.ids.lock());
+            changes.push(Change::Create { id, tags: vec![path_tag(&p)], content: None });
             aux.push(Aux::Put(identity_key(&id), ident.encode()));
             report.added += 1;
         }
         if !changes.is_empty() || !aux.is_empty() {
-            self.image.commit_batch(&mut Batch { changes: &changes, aux: &aux, ..Batch::default() })?;
+            self.image.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() })?;
         }
         Ok(report)
     }
@@ -818,8 +855,8 @@ impl Inner {
         // 涉及的实体：修改前的路径（只对修改前就存在的实体），以及按顺序模拟下来的 Tag（`None` 是已删除）。
         let mut before: BTreeMap<EntityId, Option<HostPath>> = BTreeMap::new();
         let mut after: BTreeMap<EntityId, Option<Vec<Tag>>> = BTreeMap::new();
-        let mut content_ops: BTreeMap<EntityId, Vec<usize>> = BTreeMap::new();
         let mut copies: Vec<(usize, EntityId, EntityId)> = Vec::new();
+        let mut created: Vec<(EntityId, StageId)> = Vec::new();
         let mut load = |id: &EntityId, after: &mut BTreeMap<EntityId, Option<Vec<Tag>>>| -> Result<(), UnitError> {
             if !after.contains_key(id) {
                 let tags = snap.get(id)?.map(|r| r.tags);
@@ -832,9 +869,12 @@ impl Inner {
         };
         for (i, c) in changes.iter().enumerate() {
             match c {
-                Change::Create { id, tags, .. } => {
+                Change::Create { id, tags, content } => {
                     load(id, &mut after)?;
                     after.insert(*id, Some(tags.clone()));
+                    if let Some(s) = content {
+                        created.push((*id, *s));
+                    }
                 }
                 Change::Copy { from, id, tags } => {
                     load(from, &mut after)?;
@@ -860,13 +900,6 @@ impl Inner {
                         tags.retain(|t| t != tag);
                     }
                 }
-                Change::Write { id, .. } | Change::Truncate { id, .. } => {
-                    load(id, &mut after)?;
-                    if after[id].is_none() {
-                        return Err(UnitError::NotFound(*id));
-                    }
-                    content_ops.entry(*id).or_default().push(i);
-                }
             }
         }
         drop(snap);
@@ -877,56 +910,51 @@ impl Inner {
             finals.insert(*id, tags.as_ref().map(|t| path_of(t)).transpose()?);
         }
         let on_host = |e: &EntityId| matches!(before.get(e), Some(Some(_)));
-        let later_op = |e: &EntityId, i: usize| content_ops.get(e).is_some_and(|v| v.iter().any(|&j| j > i));
-        let later_copy_from = |e: &EntityId, i: usize| copies.iter().any(|(j, f, _)| f == e && *j > i);
 
-        // 内容要搬进镜像的路径实体。
-        let mut hydrate_set = BTreeSet::new();
+        // 失去路径的路径实体：内容搬进镜像。其余路径实体的内容一直留在宿主。
+        let hydrate: Vec<(EntityId, HostPath)> = finals
+            .iter()
+            .filter(|(id, fin)| on_host(id) && matches!(fin, Some(None)))
+            .map(|(id, _)| (*id, before[id].clone().expect("on host")))
+            .collect();
+        let hydrated: BTreeSet<EntityId> = hydrate.iter().map(|(id, _)| *id).collect();
+        let direct: BTreeSet<EntityId> =
+            before.iter().filter(|(id, p)| p.is_some() && !hydrated.contains(id)).map(|(id, _)| *id).collect();
+
+        // 从路径实体复制：目标有路径就在宿主上复制文件，没有路径就把文件内容搬进镜像。
+        let mut copy_in = Vec::new();
+        let mut staged: BTreeMap<EntityId, HostPath> = BTreeMap::new();
         for (i, f, t) in &copies {
             if !on_host(f) {
                 continue;
             }
-            let target_ok = match &finals[t] {
-                None => true,
-                Some(None) => false,
-                Some(Some(_)) => !later_op(t, *i) && !later_copy_from(t, *i),
-            };
-            if !target_ok || later_op(f, *i) {
-                hydrate_set.insert(*f);
-            }
-        }
-        for (id, fin) in &finals {
-            if on_host(id) && matches!(fin, Some(None)) {
-                hydrate_set.insert(*id);
-            }
-        }
-        // 内容一直留在宿主、直接改文件的实体。
-        let direct: BTreeSet<EntityId> =
-            before.iter().filter(|(id, p)| p.is_some() && !hydrate_set.contains(id)).map(|(id, _)| *id).collect();
-        let mut staged: BTreeMap<EntityId, HostPath> = BTreeMap::new();
-        for (_, f, t) in &copies {
-            if direct.contains(f) && matches!(finals[t], Some(Some(_))) {
-                staged.insert(*t, before[f].clone().expect("on host"));
+            let src = before[f].clone().expect("on host");
+            match &finals[t] {
+                None => {}
+                Some(None) => copy_in.push((*i, src)),
+                Some(Some(_)) => {
+                    staged.insert(*t, src);
+                }
             }
         }
 
-        let mut intent = Intent::default();
-        let mut image_changes = Vec::new();
-        for c in changes {
-            match c {
-                Change::Write { id, offset, data } if direct.contains(id) => {
-                    let p = before[id].clone().expect("on host");
-                    intent.edits.push((*id, p, Edit::Write { offset: *offset, data: data.clone() }));
+        // 带暂存的新实体：最后有路径（且这一批里没人从它复制）就把暂存文件改名过去，否则内容进镜像。
+        let sources: BTreeSet<EntityId> = copies.iter().map(|(_, f, _)| *f).collect();
+        let mut from_stage: BTreeMap<EntityId, StageId> = BTreeMap::new();
+        let (mut stage_in, mut stage_done) = (Vec::new(), Vec::new());
+        for (id, s) in &created {
+            match &finals[id] {
+                Some(Some(_)) if !sources.contains(id) => {
+                    from_stage.insert(*id, *s);
                 }
-                Change::Truncate { id, len } if direct.contains(id) => {
-                    let p = before[id].clone().expect("on host");
-                    intent.edits.push((*id, p, Edit::Truncate { len: *len }));
-                }
-                _ => image_changes.push(c.clone()),
+                Some(_) => stage_in.push(*s),
+                None => stage_done.push(*s),
             }
         }
-        intent.copies = staged.iter().map(|(t, src)| (*t, src.clone())).collect();
+        stage_done.extend(&stage_in);
 
+        let mut intent =
+            Intent { copies: staged.iter().map(|(t, src)| (*t, src.clone())).collect(), ..Intent::default() };
         let mut targets: BTreeSet<HostPath> = BTreeSet::new();
         for (id, fin) in &finals {
             let old = before.get(id).cloned().flatten();
@@ -939,6 +967,7 @@ impl Inner {
             let place = match &new {
                 None => Place::Nothing,
                 Some(_) if staged.contains_key(id) => Place::Staged,
+                Some(_) if from_stage.contains_key(id) => Place::FromStage(from_stage[id]),
                 Some(_) if direct.contains(id) => {
                     if old == new {
                         Place::Nothing
@@ -965,25 +994,54 @@ impl Inner {
                 return Err(PATH_TAKEN);
             }
         }
-        let hydrate = hydrate_set.into_iter().map(|id| (id, before[&id].clone().expect("on host"))).collect();
-        Ok(Plan { hydrate, changes: image_changes, intent })
+        let stage_out = from_stage.into_values().collect();
+        Ok(Plan { hydrate, copy_in, stage_in, stage_out, stage_done, intent })
     }
 
-    /// 第 1 步到第 3 步。`finish` 是同时了结的准备记录。
-    fn run(&mut self, changes: &[Change], finish: Option<(TxnId, bool)>) -> Result<(), UnitError> {
+    /// 第 1 步到第 3 步。`finish` 是同时了结的准备记录。调用者持有 `meta`。
+    fn run(&self, changes: &[Change], finish: Option<(TxnId, bool)>) -> Result<(), UnitError> {
         let plan = self.plan(changes)?;
-        let mut sources: Vec<(EntityId, HostSource)> = Vec::new();
-        for (id, p) in &plan.hydrate {
-            let file = match p.inspect(&self.root)? {
-                Some(m) if m.is_file() => Some(fs::File::open(p.on_host(&self.root)).map_err(io_err)?),
-                _ => None,
+        // 要搬进镜像的内容先分段写进镜像里的暂存（这一步不挡别人读写），提交时一起生效。
+        let mut ours = Vec::new();
+        let mut first = || -> Result<(), UnitError> {
+            let mut adopt = Vec::new();
+            for (id, p) in &plan.hydrate {
+                let s = self.image.stage()?;
+                ours.push(s);
+                self.stream_in(self.host_file(p)?, s)?;
+                adopt.push((*id, s));
+            }
+            let mut image_changes = changes.to_vec();
+            for (i, src) in &plan.copy_in {
+                let s = self.image.stage()?;
+                ours.push(s);
+                self.stream_in(self.host_file(src)?, s)?;
+                let Change::Copy { id, tags, .. } = &changes[*i] else { unreachable!("copy_in comes from a copy") };
+                image_changes[*i] = Change::Create { id: *id, tags: tags.clone(), content: Some(s) };
+            }
+            for s in &plan.stage_in {
+                self.stream_in(Some(self.staged_file(*s)), *s)?;
+            }
+            for s in &plan.stage_out {
+                self.sync_staged_file(*s)?;
+            }
+            let aux = if plan.intent.is_empty() {
+                Vec::new()
+            } else {
+                vec![Aux::Put(AUX_INTENT.to_vec(), plan.intent.encode())]
             };
-            sources.push((*id, HostSource(file)));
+            self.image.commit_batch(&Batch { adopt: &adopt, changes: &image_changes, aux: &aux, finish })
+        };
+        if let Err(e) = first() {
+            for s in ours {
+                let _ = self.image.discard_staged(s);
+            }
+            return Err(e);
         }
-        let fills = sources.iter_mut().map(|(id, s)| Fill { id: *id, source: s }).collect();
-        let aux =
-            if plan.intent.is_empty() { Vec::new() } else { vec![Aux::Put(AUX_INTENT.to_vec(), plan.intent.encode())] };
-        self.image.commit_batch(&mut Batch { fills, changes: &plan.changes, aux: &aux, finish })?;
+        // 内容已经进了镜像的暂存文件不再需要。断在这里也没关系：挂载时没有对应暂存的暂存文件会被删掉。
+        for s in &plan.stage_done {
+            self.remove_staged_file(*s)?;
+        }
         if plan.intent.is_empty() {
             return Ok(());
         }
@@ -998,27 +1056,8 @@ impl Inner {
         fs::create_dir_all(&tmp).map_err(io_err)?;
         let staged = |id: &EntityId, ext: &str| tmp.join(format!("{}.{ext}", hex(id)));
 
-        // 直接写入和复制。同一串写入从头重做，结果和只做一遍一样。
-        if !tmp.join(EDITED).exists() {
-            let mut touched: BTreeMap<&HostPath, fs::File> = BTreeMap::new();
-            for (_, p, edit) in &intent.edits {
-                if !touched.contains_key(p) {
-                    // 文件在宿主上被删掉了就跳过，对账时实体会被删掉。
-                    if !matches!(p.inspect(&self.root)?, Some(m) if m.is_file()) {
-                        continue;
-                    }
-                    let f = fs::OpenOptions::new().write(true).open(p.on_host(&self.root)).map_err(io_err)?;
-                    touched.insert(p, f);
-                }
-                let f = &touched[p];
-                match edit {
-                    Edit::Write { offset, data } => write_at(f, *offset, data).map_err(io_err)?,
-                    Edit::Truncate { len } => f.set_len(*len).map_err(io_err)?,
-                }
-            }
-            for f in touched.values() {
-                f.sync_all().map_err(io_err)?;
-            }
+        // 宿主上的复制。
+        if !tmp.join(COPIED).exists() {
             for (id, src) in &intent.copies {
                 let dest = staged(id, "new");
                 match src.inspect(&self.root)? {
@@ -1031,7 +1070,7 @@ impl Inner {
                 }
                 fs::File::open(&dest).and_then(|f| f.sync_all()).map_err(io_err)?;
             }
-            fs::write(tmp.join(EDITED), b"").map_err(io_err)?;
+            fs::write(tmp.join(COPIED), b"").map_err(io_err)?;
             sync_dir(&tmp)?;
         }
 
@@ -1073,6 +1112,7 @@ impl Inner {
                 }
                 Place::Staged => staged(&it.id, "new"),
                 Place::Parked => staged(&it.id, "old"),
+                Place::FromStage(s) => self.staged_file(s),
             };
             if !from.exists() {
                 continue; // 上一次已经放好了。
@@ -1088,17 +1128,14 @@ impl Inner {
         Ok(())
     }
 
-    /// 第 3 步：从镜像写出的内容清出镜像，记下文件身份，删掉意图记录。
-    fn finish(&mut self, intent: &Intent) -> Result<(), UnitError> {
-        let mut changes = Vec::new();
+    /// 第 3 步：从镜像写出的内容清出镜像（换成空的内容），记下文件身份，删掉意图记录。
+    fn finish(&self, intent: &Intent) -> Result<(), UnitError> {
+        let mut adopt = Vec::new();
         let mut aux = vec![Aux::Delete(AUX_INTENT.to_vec())];
         let mut paths: BTreeMap<EntityId, Option<HostPath>> = BTreeMap::new();
-        for (id, p, _) in &intent.edits {
-            paths.insert(*id, Some(p.clone()));
-        }
         for it in &intent.items {
             if it.place == Place::Image {
-                changes.push(Change::Truncate { id: it.id, len: 0 });
+                adopt.push((it.id, self.image.stage()?));
             }
             paths.insert(it.id, it.new.clone());
         }
@@ -1110,8 +1147,35 @@ impl Inner {
                 _ => aux.push(Aux::Delete(identity_key(&id))),
             }
         }
-        self.image.commit_batch(&mut Batch { changes: &changes, aux: &aux, ..Batch::default() })
+        self.image.commit_batch(&Batch { adopt: &adopt, aux: &aux, ..Batch::default() })
     }
+
+    /// 准备记录里引用的暂存。
+    fn stages_of(changes: &[Change]) -> impl Iterator<Item = StageId> + '_ {
+        changes.iter().filter_map(|c| match c {
+            Change::Create { content: Some(s), .. } => Some(*s),
+            _ => None,
+        })
+    }
+}
+
+fn start_watch(root: &Path) -> Option<Watch> {
+    use notify::Watcher;
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(tx).ok()?;
+    watcher.watch(root, notify::RecursiveMode::Recursive).ok()?;
+    Some(Watch { _watcher: watcher, events: Mutex::new(rx) })
+}
+
+/// 宿主上的绝对路径在挂载目录下的各段。不在挂载目录下或名字不是 UTF-8 时为 `None`。
+fn scope_of(root: &Path, p: &Path) -> Option<Scope> {
+    let rel = p.strip_prefix(root).ok()?;
+    rel.components()
+        .map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().map(String::from),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 走一遍 `dir`（挂载目录下 `names` 那一级），收集可映射的普通文件。不跟随符号链接。
@@ -1157,7 +1221,7 @@ fn walk(
 
 impl Unit for DirUnit {
     fn id(&self) -> UnitId {
-        self.inner.borrow().image.id()
+        self.image.id()
     }
 
     fn mapped_keys(&self) -> &[&'static str] {
@@ -1166,58 +1230,128 @@ impl Unit for DirUnit {
 
     fn snapshot(&self) -> Box<dyn Snapshot> {
         // 先把宿主上的改动同步进来。失败时留着错误给下一个能报错的调用。
-        if let Err(e) = self.sync() {
-            self.sync_error.set(Some(e));
+        if let Err(e) = self.refresh() {
+            *self.sync_error.lock() = Some(e);
         }
-        Box::new(DirSnapshot { inner: self.inner.borrow().image.snapshot(), root: self.root.clone() })
+        Box::new(DirSnapshot { inner: self.image.snapshot(), root: self.root.clone() })
     }
 
-    fn apply(&mut self, changes: &[Change]) -> Result<(), UnitError> {
-        self.sync_mut()?;
-        self.inner.get_mut().run(changes, None)
+    /// 路径实体直接写宿主文件；其余的写镜像。
+    fn write(&self, id: &EntityId, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        match self.located(id)? {
+            None => self.image.write(id, offset, data),
+            Some(p) => {
+                write_at(&self.open_host(id, &p)?, offset, data).map_err(io_err)?;
+                self.dirty.lock().insert(p);
+                Ok(())
+            }
+        }
     }
 
-    fn prepare(&mut self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
-        self.sync_mut()?;
+    fn set_len(&self, id: &EntityId, len: u64) -> Result<(), UnitError> {
+        match self.located(id)? {
+            None => self.image.set_len(id, len),
+            Some(p) => {
+                self.open_host(id, &p)?.set_len(len).map_err(io_err)?;
+                self.dirty.lock().insert(p);
+                Ok(())
+            }
+        }
+    }
+
+    fn sync(&self) -> Result<(), UnitError> {
+        self.image.sync()?;
+        let dirty = std::mem::take(&mut *self.dirty.lock());
+        for p in dirty {
+            if let Some(f) = self.host_file(&p)? {
+                fs::File::open(f).and_then(|f| f.sync_all()).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 暂存放在宿主上的暂存文件里；镜像里同时有一份空的暂存，编号由它分配，断电后靠它认领暂存文件。
+    fn stage(&self) -> Result<StageId, UnitError> {
+        let s = self.image.stage()?;
+        let made = fs::create_dir_all(self.root.join(RESERVED).join(STAGED))
+            .and_then(|()| fs::File::create(self.staged_file(s)).map(|_| ()));
+        if let Err(e) = made {
+            let _ = self.image.discard_staged(s);
+            return Err(io_err(e));
+        }
+        Ok(s)
+    }
+
+    fn write_staged(&self, stage: StageId, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        let f = match fs::OpenOptions::new().write(true).open(self.staged_file(stage)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(UnitError::UnknownStage(stage)),
+            Err(e) => return Err(io_err(e)),
+        };
+        write_at(&f, offset, data).map_err(io_err)
+    }
+
+    fn discard_staged(&self, stage: StageId) -> Result<(), UnitError> {
+        self.image.discard_staged(stage)?;
+        self.remove_staged_file(stage)
+    }
+
+    fn apply(&self, changes: &[Change]) -> Result<(), UnitError> {
+        self.refresh()?;
+        let _one = self.meta.lock();
+        self.run(changes, None)
+    }
+
+    fn prepare(&self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
+        self.refresh()?;
+        let _one = self.meta.lock();
         // 先检查路径，免得提交点之后才发现这个单元做不了。
-        let inner = self.inner.get_mut();
-        inner.plan(changes)?;
-        inner.image.prepare(txn, changes)
+        self.plan(changes)?;
+        for s in Self::stages_of(changes) {
+            self.sync_staged_file(s)?;
+        }
+        self.image.prepare(txn, changes)
     }
 
     fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError> {
-        self.inner.borrow().image.prepared()
+        self.image.prepared()
     }
 
-    fn commit_prepared(&mut self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
-        self.sync_mut()?;
-        let inner = self.inner.get_mut();
+    fn commit_prepared(&self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
+        self.refresh()?;
+        let _one = self.meta.lock();
         let (_, changes) =
-            inner.image.prepared()?.into_iter().find(|(t, _)| t.id == txn).ok_or(UnitError::UnknownTxn(txn))?;
-        inner.run(&changes, Some((txn, as_primary)))
+            self.image.prepared()?.into_iter().find(|(t, _)| t.id == txn).ok_or(UnitError::UnknownTxn(txn))?;
+        self.run(&changes, Some((txn, as_primary)))
     }
 
-    fn abort_prepared(&mut self, txn: TxnId) -> Result<(), UnitError> {
-        self.inner.get_mut().image.abort_prepared(txn)
+    fn abort_prepared(&self, txn: TxnId) -> Result<(), UnitError> {
+        let _one = self.meta.lock();
+        let (_, changes) =
+            self.image.prepared()?.into_iter().find(|(t, _)| t.id == txn).ok_or(UnitError::UnknownTxn(txn))?;
+        self.image.abort_prepared(txn)?;
+        for s in Self::stages_of(&changes) {
+            self.remove_staged_file(s)?;
+        }
+        Ok(())
     }
 
     fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {
-        self.inner.borrow().image.committed()
+        self.image.committed()
     }
 
-    fn forget(&mut self, txn: TxnId) -> Result<(), UnitError> {
-        self.inner.get_mut().image.forget(txn)
+    fn forget(&self, txn: TxnId) -> Result<(), UnitError> {
+        self.image.forget(txn)
     }
 
     /// 先和宿主目录全量对账，再检查镜像。
-    fn check(&mut self) -> Result<(), UnitError> {
+    fn check(&self) -> Result<(), UnitError> {
         self.rescan()?;
-        self.inner.get_mut().image.verify()
+        self.image.verify()
     }
 
     fn describe(&self) -> Vec<(&'static str, String)> {
-        let inner = self.inner.borrow();
-        let snap = inner.image.snapshot();
+        let snap = self.image.snapshot();
         let (ns, key) = hostfs_key();
         let files = snap.probe(&Probe::Has { ns: &ns, key: &key }).ok().flatten().map_or(0, |f| f.len());
         let all = snap.all().map_or(0, |a| a.len());
@@ -1226,7 +1360,7 @@ impl Unit for DirUnit {
             ("files", format!("{files} mapped from the directory, {} only in the image", all - files)),
             ("live sync", String::from(if self.is_live() { "yes" } else { "no" })),
         ];
-        for (name, value) in inner.image.describe() {
+        for (name, value) in self.image.describe() {
             out.push((if name == "size" { "image size" } else { name }, value));
         }
         out

@@ -71,8 +71,10 @@ mod tests {
     fn format_then_open() {
         let path = std::env::temp_dir().join(format!("tagfs-backend-disk-{}.bin", std::process::id()));
         std::fs::File::create(&path).unwrap().set_len(1 << 20).unwrap();
-        let mut unit = super::format(&path, UnitId([2; 16])).unwrap();
-        unit.apply(&[Change::Create { id: EntityId([1; 16]), tags: vec![], content: b"on disk".to_vec() }]).unwrap();
+        let unit = super::format(&path, UnitId([2; 16])).unwrap();
+        let stage = unit.stage().unwrap();
+        unit.write_staged(stage, 0, b"on disk").unwrap();
+        unit.apply(&[Change::Create { id: EntityId([1; 16]), tags: vec![], content: Some(stage) }]).unwrap();
         drop(unit);
         let unit = super::open(&path).unwrap();
         unit.verify().unwrap();

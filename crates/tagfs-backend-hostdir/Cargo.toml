@@ -17,6 +17,7 @@ tagfs-backend-file = { path = "../tagfs-backend-file" }
 tagfs-block = { path = "../tagfs-block" }
 tagfs-core = { path = "../tagfs-core" }
 tagfs-proto = { path = "../tagfs-proto" }
+tagfs-sync = { path = "../tagfs-sync", features = ["std"] }
 
 [dev-dependencies]
 tagfs-backend-mem = { path = "../tagfs-backend-mem" }

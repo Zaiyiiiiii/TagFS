@@ -6,16 +6,20 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tagfs_device::{BlockDevice, DeviceError, in_range};
 
 pub struct FileDevice {
     file: File,
     block_size: u32,
-    capacity: u64,
+    /// 扩容时改变；读写时按当时的值检查范围。
+    capacity: AtomicU64,
     read_only: bool,
     /// 普通文件可以扩容；裸盘不行。
     growable: bool,
+    /// 扩容一次只做一个。
+    growing: tagfs_sync::Mutex<()>,
 }
 
 impl FileDevice {
@@ -26,9 +30,10 @@ impl FileDevice {
         Ok(FileDevice {
             file,
             block_size,
-            capacity: round_down(capacity, block_size),
+            capacity: AtomicU64::new(round_down(capacity, block_size)),
             read_only: false,
             growable: true,
+            growing: tagfs_sync::Mutex::new(()),
         })
     }
 
@@ -38,7 +43,14 @@ impl FileDevice {
         // 裸盘的 metadata().len() 是 0，用 seek 到末尾取大小，对普通文件也成立。
         let len = file.seek(SeekFrom::End(0))?;
         let growable = !read_only && file.metadata()?.is_file();
-        Ok(FileDevice { file, block_size, capacity: round_down(len, block_size), read_only, growable })
+        Ok(FileDevice {
+            file,
+            block_size,
+            capacity: AtomicU64::new(round_down(len, block_size)),
+            read_only,
+            growable,
+            growing: tagfs_sync::Mutex::new(()),
+        })
     }
 }
 
@@ -97,50 +109,52 @@ impl BlockDevice for FileDevice {
     }
 
     fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Acquire)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
-        if !in_range(self.capacity, offset, buf.len()) {
+        if !in_range(self.capacity(), offset, buf.len()) {
             return Err(DeviceError::OutOfRange);
         }
         read_exact_at(&self.file, buf, offset).map_err(io_err)
     }
 
-    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
         if self.read_only {
             return Err(DeviceError::ReadOnly);
         }
-        if !in_range(self.capacity, offset, buf.len()) {
+        if !in_range(self.capacity(), offset, buf.len()) {
             return Err(DeviceError::OutOfRange);
         }
         write_all_at(&self.file, buf, offset).map_err(io_err)
     }
 
-    fn flush(&mut self) -> Result<(), DeviceError> {
+    fn flush(&self) -> Result<(), DeviceError> {
         if self.read_only {
             return Ok(());
         }
         self.file.sync_data().map_err(io_err)
     }
 
-    fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError> {
+    fn trim(&self, offset: u64, len: u64) -> Result<(), DeviceError> {
         // 只是提示，宿主机文件上不做任何事。
-        if !in_range(self.capacity, offset, len as usize) {
+        if !in_range(self.capacity(), offset, len as usize) {
             return Err(DeviceError::OutOfRange);
         }
         Ok(())
     }
 
-    fn grow(&mut self, capacity: u64) -> Result<(), DeviceError> {
+    fn grow(&self, capacity: u64) -> Result<(), DeviceError> {
         if !self.growable {
             return Err(DeviceError::Unsupported);
         }
+        let _one_at_a_time = self.growing.lock();
         let capacity = round_down(capacity, self.block_size);
-        if capacity > self.capacity {
-            // 文件变长，新增部分是空洞：不占空间，读出来是零。
+        if capacity > self.capacity() {
+            // 文件变长，新增部分是空洞：不占空间，读出来是零。先变长再公布新容量，
+            // 这样按新容量检查通过的读写一定落在文件里。
             self.file.set_len(capacity).map_err(io_err)?;
-            self.capacity = capacity;
+            self.capacity.store(capacity, Ordering::Release);
         }
         Ok(())
     }
@@ -157,7 +171,7 @@ mod tests {
     #[test]
     fn writes_survive_reopening() {
         let path = temp_path("reopen");
-        let mut dev = FileDevice::create(&path, 64 * 1024 + 100, 4096).unwrap();
+        let dev = FileDevice::create(&path, 64 * 1024 + 100, 4096).unwrap();
         assert_eq!(dev.capacity(), 64 * 1024);
         dev.write_at(5000, b"hello").unwrap();
         dev.flush().unwrap();
@@ -167,13 +181,12 @@ mod tests {
         let mut buf = [0u8; 7];
         dev.read_at(4999, &mut buf).unwrap();
         assert_eq!(&buf, b"\0hello\0");
-        let mut ro = dev;
-        assert_eq!(ro.write_at(0, b"x"), Err(DeviceError::ReadOnly));
-        assert_eq!(ro.read_at(64 * 1024 - 1, &mut [0u8; 2]), Err(DeviceError::OutOfRange));
-        assert_eq!(ro.grow(1 << 20), Err(DeviceError::Unsupported));
-        drop(ro);
+        assert_eq!(dev.write_at(0, b"x"), Err(DeviceError::ReadOnly));
+        assert_eq!(dev.read_at(64 * 1024 - 1, &mut [0u8; 2]), Err(DeviceError::OutOfRange));
+        assert_eq!(dev.grow(1 << 20), Err(DeviceError::Unsupported));
+        drop(dev);
 
-        let mut dev = FileDevice::open(&path, 4096, false).unwrap();
+        let dev = FileDevice::open(&path, 4096, false).unwrap();
         dev.grow(1 << 20).unwrap();
         assert_eq!(dev.capacity(), 1 << 20);
         dev.write_at((1 << 20) - 1, b"z").unwrap();

@@ -2,21 +2,31 @@
 //!
 //! - 可见性：实体身上每道边界都能越过才可见；不可见的实体在所有读接口上都和不存在一样。
 //! - 查询：分发给每个在线单元，结果合并。
-//! - 事务：只涉及一个单元时直接提交；涉及多个单元时做两阶段提交，仍是一个原子操作。
+//! - 元数据事务：只涉及一个单元时直接提交；涉及多个单元时做两阶段提交，仍是一个原子操作。
 //!   事务没在所有参与单元上完成之前，涉及的实体带 `tagfs:txn_pending`，结果确定前只读。
+//! - 内容：按偏移直接读写所在单元，不经过事务（和 NTFS、ext4 一样）。要和实体一起原子出现的内容
+//!   先写进暂存（[`Volume::stage`]），建实体时引用它。
+//! - 并发：卷的方法都可以被多个线程同时调用。读不加锁；修改按实体加锁，同一个实体上的写入和修改
+//!   排队，不同实体互不相干。
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+
+use tagfs_sync::{Keyed, Mutex, RwLock};
 
 use crate::id::{EntityId, IdSource, TxnId};
 use crate::policy::Policy;
 use crate::query::Query;
 use crate::tag::{Key, Namespace, Tag, Value, tagfs_keys};
-use crate::unit::{Change, EntityRecord, Snapshot, TxnInfo, Unit, UnitError, UnitId};
+use crate::unit::{Change, EntityRecord, Snapshot, StageId, TxnInfo, Unit, UnitError, UnitId};
+
+/// 跨单元复制时一次搬多少。
+const COPY_CHUNK: usize = 1 << 20;
 
 /// 调用者看到的实体。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,11 +75,21 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+type Units = Vec<Arc<dyn Unit>>;
+/// 实体所在的单元和它的记录。
+type Located = (Arc<dyn Unit>, EntityRecord);
+
 pub struct Volume<P: Policy> {
     policy: P,
-    ids: Box<dyn IdSource>,
+    ids: Mutex<Box<dyn IdSource + Send>>,
     /// 在线单元，按加入顺序。没指定单元时新实体放进第一个。
-    units: Vec<Box<dyn Unit>>,
+    units: RwLock<Units>,
+    /// 按实体加的锁：读内容共享，写内容和元数据修改独占。
+    locks: Keyed<EntityId>,
+    /// 正在进行的跨单元事务。恢复时不碰它们：它们的准备记录还没到该了结的时候。
+    in_flight: Mutex<BTreeSet<TxnId>>,
+    /// 恢复一次只做一个。
+    resolving: Mutex<()>,
 }
 
 fn pending_tag(txn: TxnId) -> Tag {
@@ -80,47 +100,89 @@ fn is_pending(tags: &[Tag]) -> bool {
     tags.iter().any(|t| t.ns.is_tagfs() && t.key.as_str() == tagfs_keys::TXN_PENDING)
 }
 
+fn find(units: &Units, id: UnitId) -> Option<&Arc<dyn Unit>> {
+    units.iter().find(|u| u.id() == id)
+}
+
+/// 一份暂存的内容：写好之后交给 [`Txn::create_from`]，随实体一起出现。没用上就在放掉时丢掉。
+pub struct Stage {
+    unit: Arc<dyn Unit>,
+    id: StageId,
+    used: bool,
+}
+
+impl Stage {
+    /// 暂存所在的单元，也就是用它建出的实体所在的单元。
+    pub fn unit(&self) -> UnitId {
+        self.unit.id()
+    }
+
+    /// 从 `offset` 起写入，超过当前长度的部分补零扩展。
+    pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), Error> {
+        Ok(self.unit.write_staged(self.id, offset, data)?)
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if !self.used {
+            let _ = self.unit.discard_staged(self.id);
+        }
+    }
+}
+
 impl<P: Policy> Volume<P> {
-    pub fn new(policy: P, ids: Box<dyn IdSource>) -> Self {
-        Volume { policy, ids, units: Vec::new() }
+    pub fn new(policy: P, ids: Box<dyn IdSource + Send>) -> Self {
+        Volume {
+            policy,
+            ids: Mutex::new(ids),
+            units: RwLock::new(Vec::new()),
+            locks: Keyed::new(),
+            in_flight: Mutex::new(BTreeSet::new()),
+            resolving: Mutex::new(()),
+        }
     }
 
     /// 单元上线。它带着的未了结事务在这里恢复：能确定结果的照结果完成，不能确定的
     /// 给涉及的实体打上 `tagfs:txn_pending`，等主单元上线再定。
-    pub fn attach(&mut self, unit: Box<dyn Unit>) -> Result<(), Error> {
-        if self.position(unit.id()).is_none() {
-            self.units.push(unit);
+    pub fn attach(&self, unit: Arc<dyn Unit>) -> Result<(), Error> {
+        {
+            let mut units = self.units.write();
+            if find(&units, unit.id()).is_none() {
+                units.push(unit);
+            }
         }
         self.resolve()
     }
 
-    /// 单元离线，它的实体随之从卷里消失。
-    pub fn detach(&mut self, id: UnitId) -> Option<Box<dyn Unit>> {
-        let i = self.position(id)?;
-        Some(self.units.remove(i))
+    /// 单元离线，它的实体随之从卷里消失。正在进行的读写还拿着它的，做完为止。
+    pub fn detach(&self, id: UnitId) -> Option<Arc<dyn Unit>> {
+        let mut units = self.units.write();
+        let i = units.iter().position(|u| u.id() == id)?;
+        Some(units.remove(i))
     }
 
     pub fn unit_ids(&self) -> Vec<UnitId> {
-        self.units.iter().map(|u| u.id()).collect()
+        self.units.read().iter().map(|u| u.id()).collect()
     }
 
-    pub fn unit(&self, id: UnitId) -> Option<&dyn Unit> {
-        self.position(id).map(|i| &*self.units[i])
+    pub fn unit(&self, id: UnitId) -> Option<Arc<dyn Unit>> {
+        find(&self.units.read(), id).cloned()
     }
 
-    fn position(&self, id: UnitId) -> Option<usize> {
-        self.units.iter().position(|u| u.id() == id)
+    fn units(&self) -> Units {
+        self.units.read().clone()
     }
 
-    fn snapshots(&self) -> Vec<(UnitId, Box<dyn Snapshot>)> {
-        self.units.iter().map(|u| (u.id(), u.snapshot())).collect()
+    fn new_id(&self) -> EntityId {
+        EntityId::generate(&mut **self.ids.lock())
     }
 
     /// 找实体所在的单元，不看可见性。
-    fn locate(&self, id: &EntityId) -> Result<Option<(UnitId, EntityRecord)>, Error> {
-        for u in &self.units {
+    fn locate(&self, id: &EntityId) -> Result<Option<Located>, Error> {
+        for u in self.units() {
             if let Some(r) = u.snapshot().get(id)? {
-                return Ok(Some((u.id(), r)));
+                return Ok(Some((u, r)));
             }
         }
         Ok(None)
@@ -147,8 +209,20 @@ impl<P: Policy> Volume<P> {
     }
 
     /// 实体所在的单元和记录；不可见当作不存在，返回 `NotFound`。
-    fn visible_record(&self, ctx: &P::Context, id: &EntityId) -> Result<(UnitId, EntityRecord), Error> {
+    fn visible_record(&self, ctx: &P::Context, id: &EntityId) -> Result<Located, Error> {
         self.locate(id)?.filter(|(_, r)| self.visible(ctx, &r.tags)).ok_or(Error::NotFound)
+    }
+
+    /// 调用者能修改的实体所在的单元：可见、不在未完成事务里、策略允许修改。
+    fn modifiable(&self, ctx: &P::Context, id: &EntityId) -> Result<Arc<dyn Unit>, Error> {
+        let (unit, r) = self.visible_record(ctx, id)?;
+        if is_pending(&r.tags) {
+            return Err(Error::Pending);
+        }
+        if !self.policy.can_modify(ctx, &r.tags) {
+            return Err(Error::NotWritable);
+        }
+        Ok(unit)
     }
 
     /// 调用者看得到的那部分 Tag。
@@ -162,10 +236,57 @@ impl<P: Policy> Volume<P> {
         Ok(Entity { id: r.id, tags: self.readable(ctx, r.tags), size: r.size })
     }
 
+    /// 从 `offset` 起读内容，返回读到的字节数（到末尾时少于 `buf.len()`）。读多少由调用者决定。
     pub fn read(&self, ctx: &P::Context, id: &EntityId, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let _lock = self.locks.read(id);
         let (unit, _) = self.visible_record(ctx, id)?;
-        let i = self.position(unit).ok_or(Error::NotFound)?;
-        Ok(self.units[i].snapshot().read(id, offset, buf)?)
+        Ok(unit.snapshot().read(id, offset, buf)?)
+    }
+
+    /// 从 `offset` 起写内容，超过当前长度的部分补零扩展。直接写进实体所在的单元，立刻对读者可见；
+    /// [`Volume::flush`] 之后保证落盘。
+    pub fn write(&self, ctx: &P::Context, id: &EntityId, offset: u64, data: &[u8]) -> Result<(), Error> {
+        let _lock = self.locks.write(id);
+        Ok(self.modifiable(ctx, id)?.write(id, offset, data)?)
+    }
+
+    /// 把内容截短或补零加长到 `len`。
+    pub fn set_len(&self, ctx: &P::Context, id: &EntityId, len: u64) -> Result<(), Error> {
+        let _lock = self.locks.write(id);
+        Ok(self.modifiable(ctx, id)?.set_len(id, len)?)
+    }
+
+    /// 让实体所在单元之前的写入都落盘。
+    pub fn flush(&self, ctx: &P::Context, id: &EntityId) -> Result<(), Error> {
+        let (unit, _) = self.visible_record(ctx, id)?;
+        Ok(unit.sync()?)
+    }
+
+    /// 让所有在线单元之前的写入都落盘。
+    pub fn sync(&self) -> Result<(), Error> {
+        let mut first = Ok(());
+        for u in self.units() {
+            if let Err(e) = u.sync() {
+                first = first.and(Err(e.into()));
+            }
+        }
+        first
+    }
+
+    /// 新的一份暂存。`unit` 为空时由卷决定放在哪个单元。
+    pub fn stage(&self, unit: Option<UnitId>) -> Result<Stage, Error> {
+        let unit = self.placement(unit)?;
+        let id = unit.stage()?;
+        Ok(Stage { unit, id, used: false })
+    }
+
+    fn placement(&self, unit: Option<UnitId>) -> Result<Arc<dyn Unit>, Error> {
+        let units = self.units.read();
+        match unit {
+            Some(u) => find(&units, u).cloned(),
+            None => units.first().cloned(),
+        }
+        .ok_or(Error::NoUnit)
     }
 
     /// 满足条件、且对调用者可见的实体，按 EntityId 排序。条件只对调用者看得到的 Tag 判断。
@@ -182,7 +303,8 @@ impl<P: Policy> Volume<P> {
         limit: usize,
     ) -> Result<Vec<EntityId>, Error> {
         let mut out = Vec::new();
-        for (_, snap) in self.snapshots() {
+        for u in self.units() {
+            let snap = u.snapshot();
             let candidates = match candidates(&*snap, query)? {
                 Some(c) => c,
                 None => snap.all()?,
@@ -205,115 +327,127 @@ impl<P: Policy> Volume<P> {
         Ok(out)
     }
 
-    pub fn begin<'a>(&'a mut self, ctx: &'a P::Context) -> Txn<'a, P> {
-        Txn { vol: self, ctx, changes: BTreeMap::new(), created: BTreeMap::new(), deleted: BTreeSet::new() }
+    pub fn begin<'a>(&'a self, ctx: &'a P::Context) -> Txn<'a, P> {
+        Txn {
+            vol: self,
+            ctx,
+            changes: BTreeMap::new(),
+            created: BTreeMap::new(),
+            deleted: BTreeSet::new(),
+            stages: Vec::new(),
+        }
     }
 
-    /// 依据在线单元的状态推进所有未了结的跨单元事务。
-    fn resolve(&mut self) -> Result<(), Error> {
+    /// 依据在线单元的状态推进所有未了结的跨单元事务（正在进行的除外）。
+    fn resolve(&self) -> Result<(), Error> {
+        let _one = self.resolving.lock();
+        let units = self.units();
+        let in_flight = self.in_flight.lock().clone();
         // 带准备记录的单元：问主单元。
         let mut work = Vec::new();
-        for u in &self.units {
+        for u in &units {
             for (info, changes) in u.prepared()? {
-                work.push((u.id(), info, changes));
+                if !in_flight.contains(&info.id) {
+                    work.push((u.clone(), info, changes));
+                }
             }
         }
         for (unit, info, changes) in work {
-            let Some(primary) = self.position(info.primary) else {
+            let Some(primary) = find(&units, info.primary) else {
                 // 主单元不在线，结果不能确定：给这个单元里已存在的、涉及的实体打标记。
-                self.mark_in_doubt(unit, info.id, &changes)?;
+                mark_in_doubt(&*unit, info.id, &changes)?;
                 continue;
             };
-            let committed = self.units[primary].committed()?.iter().any(|t| t.id == info.id);
-            let i = self.position(unit).expect("online");
+            let committed = primary.committed()?.iter().any(|t| t.id == info.id);
             if committed {
-                self.units[i].commit_prepared(info.id, false)?;
-            } else if self.has_prepared(i, info.id)? {
+                unit.commit_prepared(info.id, false)?;
+            } else if has_prepared(&*unit, info.id)? {
                 // 主单元没有提交：要么它自己还停在准备阶段（提交点之前就断了），
                 // 要么它已经放弃。两种情况都放弃这个事务。
-                self.abort_everywhere(info.id)?;
+                abort_everywhere(&units, info.id)?;
             }
         }
         // 主单元记下的已提交事务：全部参与单元都完成后，去掉标记并清掉记录。
         let mut done = Vec::new();
-        for u in &self.units {
+        for u in &units {
             for info in u.committed()? {
+                if in_flight.contains(&info.id) {
+                    continue;
+                }
                 let mut finished = true;
                 for p in &info.participants {
-                    finished &= match self.position(*p) {
-                        Some(i) => !self.has_prepared(i, info.id)?,
+                    finished &= match find(&units, *p) {
+                        Some(pu) => !has_prepared(&**pu, info.id)?,
                         None => false,
                     };
                 }
                 if finished {
-                    done.push((u.id(), info));
+                    done.push((u.clone(), info));
                 }
             }
         }
         for (primary, info) in done {
             for p in &info.participants {
-                self.clear_pending(*p, info.id)?;
-            }
-            let i = self.position(primary).expect("online");
-            self.units[i].forget(info.id)?;
-        }
-        Ok(())
-    }
-
-    fn has_prepared(&self, unit: usize, txn: TxnId) -> Result<bool, Error> {
-        Ok(self.units[unit].prepared()?.iter().any(|(t, _)| t.id == txn))
-    }
-
-    fn abort_everywhere(&mut self, txn: TxnId) -> Result<(), Error> {
-        for i in 0..self.units.len() {
-            if self.has_prepared(i, txn)? {
-                self.units[i].abort_prepared(txn)?;
-                let id = self.units[i].id();
-                self.clear_pending(id, txn)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn mark_in_doubt(&mut self, unit: UnitId, txn: TxnId, changes: &[Change]) -> Result<(), Error> {
-        let i = self.position(unit).expect("online");
-        let snap = self.units[i].snapshot();
-        let tag = pending_tag(txn);
-        let mut marks = Vec::new();
-        for id in changes.iter().map(Change::entity).collect::<BTreeSet<_>>() {
-            if snap.get(&id)?.is_some_and(|r| !r.tags.contains(&tag)) {
-                marks.push(Change::AddTag { id, tag: tag.clone() });
-            }
-        }
-        if !marks.is_empty() {
-            self.units[i].apply(&marks)?;
-        }
-        Ok(())
-    }
-
-    fn clear_pending(&mut self, unit: UnitId, txn: TxnId) -> Result<(), Error> {
-        let Some(i) = self.position(unit) else { return Ok(()) };
-        let tag = pending_tag(txn);
-        let snap = self.units[i].snapshot();
-        let probe = crate::query::Probe::Is(&tag);
-        let ids = match snap.probe(&probe)? {
-            Some(ids) => ids,
-            None => {
-                let mut ids = Vec::new();
-                for id in snap.all()? {
-                    if snap.get(&id)?.is_some_and(|r| r.tags.contains(&tag)) {
-                        ids.push(id);
-                    }
+                if let Some(pu) = find(&units, *p) {
+                    clear_pending(&**pu, info.id)?;
                 }
-                ids
             }
-        };
-        let clears: Vec<Change> = ids.into_iter().map(|id| Change::RemoveTag { id, tag: tag.clone() }).collect();
-        if !clears.is_empty() {
-            self.units[i].apply(&clears)?;
+            primary.forget(info.id)?;
         }
         Ok(())
     }
+}
+
+fn has_prepared(unit: &dyn Unit, txn: TxnId) -> Result<bool, Error> {
+    Ok(unit.prepared()?.iter().any(|(t, _)| t.id == txn))
+}
+
+fn abort_everywhere(units: &Units, txn: TxnId) -> Result<(), Error> {
+    for u in units {
+        if has_prepared(&**u, txn)? {
+            u.abort_prepared(txn)?;
+            clear_pending(&**u, txn)?;
+        }
+    }
+    Ok(())
+}
+
+fn mark_in_doubt(unit: &dyn Unit, txn: TxnId, changes: &[Change]) -> Result<(), Error> {
+    let snap = unit.snapshot();
+    let tag = pending_tag(txn);
+    let mut marks = Vec::new();
+    for id in changes.iter().map(Change::entity).collect::<BTreeSet<_>>() {
+        if snap.get(&id)?.is_some_and(|r| !r.tags.contains(&tag)) {
+            marks.push(Change::AddTag { id, tag: tag.clone() });
+        }
+    }
+    if !marks.is_empty() {
+        unit.apply(&marks)?;
+    }
+    Ok(())
+}
+
+fn clear_pending(unit: &dyn Unit, txn: TxnId) -> Result<(), Error> {
+    let tag = pending_tag(txn);
+    let snap = unit.snapshot();
+    let probe = crate::query::Probe::Is(&tag);
+    let ids = match snap.probe(&probe)? {
+        Some(ids) => ids,
+        None => {
+            let mut ids = Vec::new();
+            for id in snap.all()? {
+                if snap.get(&id)?.is_some_and(|r| r.tags.contains(&tag)) {
+                    ids.push(id);
+                }
+            }
+            ids
+        }
+    };
+    let clears: Vec<Change> = ids.into_iter().map(|id| Change::RemoveTag { id, tag: tag.clone() }).collect();
+    if !clears.is_empty() {
+        unit.apply(&clears)?;
+    }
+    Ok(())
 }
 
 /// 用索引算候选集；算不出时返回 `None`（改为扫描）。候选集只是上界，最后还要逐个核对。
@@ -346,14 +480,16 @@ fn candidates(snap: &dyn Snapshot, query: &Query) -> Result<Option<Vec<EntityId>
     })
 }
 
-/// 一组修改。提交前不影响卷；不提交就放弃。
+/// 一组元数据修改。提交前不影响卷；不提交就放弃。
 pub struct Txn<'a, P: Policy> {
-    vol: &'a mut Volume<P>,
+    vol: &'a Volume<P>,
     ctx: &'a P::Context,
     changes: BTreeMap<UnitId, Vec<Change>>,
     /// 本事务新建的实体：所在单元和建时的 Tag。
     created: BTreeMap<EntityId, (UnitId, Vec<Tag>)>,
     deleted: BTreeSet<EntityId>,
+    /// 新建实体引用的暂存。提交时交给单元用掉；没提交就随事务丢掉。
+    stages: Vec<Stage>,
 }
 
 impl<P: Policy> Txn<'_, P> {
@@ -369,7 +505,7 @@ impl<P: Policy> Txn<'_, P> {
         if is_pending(&r.tags) {
             return Err(Error::Pending);
         }
-        Ok((unit, r.tags))
+        Ok((unit.id(), r.tags))
     }
 
     /// 能否在 `unit` 里的实体上增删这个 Tag。`entity` 是实体当前的 Tag；新建实体时为 `None`。
@@ -379,20 +515,12 @@ impl<P: Policy> Txn<'_, P> {
         }
         let allowed = if tag.ns.is_tagfs() {
             // 单元映射的键按修改实体授权；新建实体时，能建就能带。
-            let mapped =
-                self.vol.position(unit).is_some_and(|i| self.vol.units[i].mapped_keys().contains(&tag.key.as_str()));
+            let mapped = self.vol.unit(unit).is_some_and(|u| u.mapped_keys().contains(&tag.key.as_str()));
             mapped && entity.is_none_or(|tags| self.vol.policy.can_modify(self.ctx, tags))
         } else {
             self.vol.policy.can_write(self.ctx, &tag.ns)
         };
         if allowed { Ok(()) } else { Err(Error::NotWritable) }
-    }
-
-    fn placement(&self, unit: Option<UnitId>) -> Result<UnitId, Error> {
-        match unit {
-            Some(u) => self.vol.position(u).map(|_| u).ok_or(Error::NoUnit),
-            None => self.vol.units.first().map(|u| u.id()).ok_or(Error::NoUnit),
-        }
     }
 
     /// 新实体（放在 `unit` 里）的 Tag：调用者给的（须可写）加上操作系统在创建时附加的。
@@ -415,36 +543,67 @@ impl<P: Policy> Txn<'_, P> {
         self.changes.entry(unit).or_default().push(change);
     }
 
-    /// 新建实体。`unit` 为空时由卷决定放在哪个单元。
-    pub fn create(&mut self, unit: Option<UnitId>, tags: Vec<Tag>, content: Vec<u8>) -> Result<EntityId, Error> {
-        let unit = self.placement(unit)?;
+    /// 新建内容为空的实体。`unit` 为空时由卷决定放在哪个单元。
+    pub fn create(&mut self, unit: Option<UnitId>, tags: Vec<Tag>) -> Result<EntityId, Error> {
+        let unit = self.vol.placement(unit)?.id();
+        self.insert(unit, tags, None)
+    }
+
+    /// 新建实体，内容是暂存里写好的；实体放在暂存所在的单元。
+    pub fn create_from(&mut self, stage: Stage, tags: Vec<Tag>) -> Result<EntityId, Error> {
+        let unit = stage.unit();
+        if self.vol.unit(unit).is_none() {
+            return Err(Error::NoUnit);
+        }
+        self.insert(unit, tags, Some(stage))
+    }
+
+    fn insert(&mut self, unit: UnitId, tags: Vec<Tag>, stage: Option<Stage>) -> Result<EntityId, Error> {
         let tags = self.creation_tags(unit, tags)?;
-        let id = EntityId::generate(&mut *self.vol.ids);
+        let id = self.vol.new_id();
         self.created.insert(id, (unit, tags.clone()));
-        self.push(unit, Change::Create { id, tags, content });
+        self.push(unit, Change::Create { id, tags, content: stage.as_ref().map(|s| s.id) });
+        self.stages.extend(stage);
         Ok(id)
     }
 
-    /// 复制：新建实体，带 `tags`，内容和 `from` 相同。同一单元里两者共享对象，直到任一方修改。
+    /// 复制：新建实体，带 `tags`，内容和 `from` 相同。同一单元里两者共享对象，直到任一方修改；
+    /// 跨单元时内容在这里搬进目标单元的暂存，提交时随新实体一起出现。
     pub fn copy(&mut self, from: &EntityId, unit: Option<UnitId>, tags: Vec<Tag>) -> Result<EntityId, Error> {
         let (src_unit, _) = self.target_readable(from)?;
         let unit = match unit {
-            Some(_) => self.placement(unit)?,
+            Some(_) => self.vol.placement(unit)?.id(),
             None => src_unit,
         };
-        let tags = self.creation_tags(unit, tags)?;
-        let id = EntityId::generate(&mut *self.vol.ids);
         if unit == src_unit {
+            let tags = self.creation_tags(unit, tags)?;
+            let id = self.vol.new_id();
             self.push(unit, Change::Copy { from: *from, id, tags: tags.clone() });
-        } else {
-            if self.created.contains_key(from) {
-                return Err(Error::Uncommitted);
-            }
-            let content = self.read_all(src_unit, from)?;
-            self.push(unit, Change::Create { id, tags: tags.clone(), content });
+            self.created.insert(id, (unit, tags));
+            return Ok(id);
         }
-        self.created.insert(id, (unit, tags));
-        Ok(id)
+        if self.created.contains_key(from) {
+            return Err(Error::Uncommitted);
+        }
+        let stage = self.vol.stage(Some(unit))?;
+        self.copy_content(src_unit, from, &stage)?;
+        self.insert(unit, tags, Some(stage))
+    }
+
+    /// 把 `from` 的内容分段搬进暂存。
+    fn copy_content(&self, src: UnitId, from: &EntityId, stage: &Stage) -> Result<(), Error> {
+        let _lock = self.vol.locks.read(from);
+        let snap = self.vol.unit(src).ok_or(Error::NoUnit)?.snapshot();
+        let mut buf = vec![0u8; COPY_CHUNK];
+        let mut offset = 0u64;
+        loop {
+            let n = snap.read(from, offset, &mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            stage.write(offset, &buf[..n])?;
+            offset += n as u64;
+        }
     }
 
     /// 可读即可（复制源不要求可写，也不受未完成事务的只读限制）。
@@ -456,17 +615,7 @@ impl<P: Policy> Txn<'_, P> {
             return Ok(created.clone());
         }
         let (unit, r) = self.vol.visible_record(self.ctx, id)?;
-        Ok((unit, r.tags))
-    }
-
-    fn read_all(&self, unit: UnitId, id: &EntityId) -> Result<Vec<u8>, Error> {
-        let i = self.vol.position(unit).ok_or(Error::NoUnit)?;
-        let snap = self.vol.units[i].snapshot();
-        let size = snap.get(id)?.ok_or(Error::NotFound)?.size;
-        let mut buf = vec![0u8; size as usize];
-        let n = snap.read(id, 0, &mut buf)?;
-        buf.truncate(n);
-        Ok(buf)
+        Ok((unit.id(), r.tags))
     }
 
     pub fn delete(&mut self, id: &EntityId) -> Result<(), Error> {
@@ -500,52 +649,76 @@ impl<P: Policy> Txn<'_, P> {
         Ok(())
     }
 
-    pub fn write(&mut self, id: &EntityId, offset: u64, data: Vec<u8>) -> Result<(), Error> {
-        let (unit, tags) = self.target(id)?;
-        if !self.vol.policy.can_modify(self.ctx, &tags) {
-            return Err(Error::NotWritable);
-        }
-        self.push(unit, Change::Write { id: *id, offset, data });
-        Ok(())
-    }
-
-    pub fn truncate(&mut self, id: &EntityId, len: u64) -> Result<(), Error> {
-        let (unit, tags) = self.target(id)?;
-        if !self.vol.policy.can_modify(self.ctx, &tags) {
-            return Err(Error::NotWritable);
-        }
-        self.push(unit, Change::Truncate { id: *id, len });
-        Ok(())
-    }
-
     /// 放弃。什么都不生效（和直接丢掉事务一样，写出来更清楚）。
     pub fn abort(self) {}
 
     /// 提交。要么全部生效，要么全部不生效。
     pub fn commit(self) -> Result<(), Error> {
-        let Txn { vol, changes, .. } = self;
+        let Txn { vol, changes, mut stages, .. } = self;
+        // 锁住涉及的实体（复制的源也锁住，免得它在提交前被删掉），再确认它们还能改：
+        // 加锁之前别人可能已经删掉了它们，或者把它们卷进了别的未完成事务。
+        let mut touched = BTreeSet::new();
+        let mut born = BTreeSet::new();
+        for c in changes.values().flatten() {
+            touched.insert(c.entity());
+            match c {
+                Change::Create { id, .. } => {
+                    born.insert(*id);
+                }
+                Change::Copy { from, id, .. } => {
+                    touched.insert(*from);
+                    born.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        let _locks = vol.locks.write_all(touched.iter().copied());
+        for id in touched.difference(&born) {
+            if let Some((_, r)) = vol.locate(id)?
+                && is_pending(&r.tags)
+            {
+                return Err(Error::Pending);
+            }
+        }
         match changes.len() {
             0 => Ok(()),
             1 => {
                 let (unit, changes) = changes.into_iter().next().expect("one");
-                let i = vol.position(unit).ok_or(Error::NoUnit)?;
-                Ok(vol.units[i].apply(&changes)?)
+                vol.unit(unit).ok_or(Error::NoUnit)?.apply(&changes)?;
+                stages.iter_mut().for_each(|s| s.used = true);
+                Ok(())
             }
-            _ => commit_across(vol, changes),
+            _ => {
+                let txn = TxnId::generate(&mut **vol.ids.lock());
+                vol.in_flight.lock().insert(txn);
+                let r = commit_across(vol, txn, changes, &mut stages);
+                vol.in_flight.lock().remove(&txn);
+                // 收尾（去掉标记、清掉主单元的记录）失败不影响结果：事务已经提交，收尾在之后的
+                // resolve 里重做。
+                if r.is_ok() {
+                    let _ = vol.resolve();
+                }
+                r
+            }
         }
     }
 }
 
 /// 跨单元两阶段提交。第一个参与单元是主单元，它的提交就是整个事务的提交点。
-fn commit_across<P: Policy>(vol: &mut Volume<P>, changes: BTreeMap<UnitId, Vec<Change>>) -> Result<(), Error> {
-    let txn = TxnId::generate(&mut *vol.ids);
+fn commit_across<P: Policy>(
+    vol: &Volume<P>,
+    txn: TxnId,
+    changes: BTreeMap<UnitId, Vec<Change>>,
+    stages: &mut [Stage],
+) -> Result<(), Error> {
     let participants: Vec<UnitId> = changes.keys().copied().collect();
     let info = TxnInfo { id: txn, primary: participants[0], participants: participants.clone() };
     let tag = pending_tag(txn);
+    let units = vol.units();
 
     // 每个涉及的实体都带上未完成标记：新建的直接带在 Tag 里，已有的追加一条 AddTag。
-    let mut prepared_units = Vec::new();
-    for (unit, mut list) in changes {
+    let mut prepared_units: Vec<&Arc<dyn Unit>> = Vec::new();
+    for (unit_id, mut list) in changes {
         let mut born = BTreeSet::new();
         let mut gone = BTreeSet::new();
         for c in &mut list {
@@ -567,31 +740,28 @@ fn commit_across<P: Policy>(vol: &mut Volume<P>, changes: BTreeMap<UnitId, Vec<C
                 list.push(Change::AddTag { id, tag: tag.clone() });
             }
         }
-        let i = vol.position(unit).ok_or(Error::NoUnit)?;
-        if let Err(e) = vol.units[i].prepare(&info, &list) {
+        let prepared = find(&units, unit_id).ok_or(Error::NoUnit).and_then(|u| Ok(u.prepare(&info, &list)?));
+        if let Err(e) = prepared {
             for u in prepared_units {
-                if let Some(j) = vol.position(u) {
-                    let _ = vol.units[j].abort_prepared(txn);
-                }
+                let _ = u.abort_prepared(txn);
             }
-            return Err(e.into());
+            return Err(e);
         }
-        prepared_units.push(unit);
+        // 暂存从此归这个单元的准备记录。
+        stages.iter_mut().filter(|s| s.unit() == unit_id).for_each(|s| s.used = true);
+        prepared_units.push(find(&units, unit_id).expect("just prepared"));
     }
 
-    let primary = vol.position(info.primary).ok_or(Error::NoUnit)?;
-    if let Err(e) = vol.units[primary].commit_prepared(txn, true) {
-        vol.abort_everywhere(txn)?;
+    let primary = find(&units, info.primary).ok_or(Error::NoUnit)?;
+    if let Err(e) = primary.commit_prepared(txn, true) {
+        abort_everywhere(&units, txn)?;
         return Err(e.into());
     }
     // 提交点已过。其余单元失败的，留着准备记录，等 resolve 再完成。
     for unit in &participants[1..] {
-        if let Some(i) = vol.position(*unit) {
-            let _ = vol.units[i].commit_prepared(txn, false);
+        if let Some(u) = find(&units, *unit) {
+            let _ = u.commit_prepared(txn, false);
         }
     }
-    // 收尾（去掉标记、清掉主单元的记录）失败不影响结果：事务已经提交，收尾在之后的
-    // resolve 里重做。
-    let _ = vol.resolve();
     Ok(())
 }

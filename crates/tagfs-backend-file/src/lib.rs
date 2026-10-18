@@ -74,9 +74,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tagfs-backend-file-{}.img", std::process::id()));
         let id = EntityId([1; 16]);
         {
-            let mut unit = super::create(&path, tagfs_core::UnitId([5; 16])).unwrap();
-            unit.apply(&[Change::Create { id, tags: vec![Tag::flag("user", "x")], content: vec![3; 9 << 20] }])
-                .unwrap();
+            let unit = super::create(&path, tagfs_core::UnitId([5; 16])).unwrap();
+            let stage = unit.stage().unwrap();
+            unit.write_staged(stage, 0, &vec![3; 9 << 20]).unwrap();
+            unit.apply(&[Change::Create { id, tags: vec![Tag::flag("user", "x")], content: Some(stage) }]).unwrap();
         }
         let unit = super::open(&path).unwrap();
         unit.verify().unwrap();

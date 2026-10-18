@@ -1,8 +1,10 @@
 //! 写时复制的 B+ 树。一个单元的全部元数据都在一棵树里，按键的第一个字节分区（见 `keys`）。
 //!
 //! 已提交的节点永远不原地修改：要改一个节点，先把它读进内存（[`Link::Mem`]），原来的块记进
-//! [`Tree::replaced`]，提交时再把内存里的节点自底向上写到新分配的块。读者拿着旧的根，
-//! 看到的始终是旧的那棵树。
+//! [`Tree::replaced`]，提交时再把内存里的节点自底向上写到新分配的块。
+//!
+//! 内存里的节点也是共享的、不可变的：一棵树的拷贝只是多拿一份根，改动时沿路径复制被别人共享着的节点，
+//! 没人共享的就地改。所以读者拿着某个时刻的根读，写者同时改，互不干扰。
 //!
 //! 节点通常占一个块。单个条目本身就超过一块时（例如很长的 Tag），它独占一个节点，
 //! 这个节点跨多个块存放；这些块不必连续，第一块里记着其余块的位置。节点的布局（多块时
@@ -26,6 +28,7 @@
 //! 删除不做合并：节点变空就从父节点摘掉，根只剩一个孩子就降一层。
 
 use alloc::borrow::Cow;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -39,10 +42,10 @@ const HEADER: usize = 20;
 const KIND_LEAF: u8 = 1;
 const KIND_BRANCH: u8 = 2;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Link {
     Disk(u64),
-    Mem(usize),
+    Mem(Arc<Node>),
 }
 
 /// 叶子里的一个条目：键和值。
@@ -171,9 +174,9 @@ fn encode(node: &Node, generation: u64, blocks: &[u64], bs: usize) -> Vec<u8> {
         }
         Node::Branch(cs) => {
             for (k, link) in cs {
-                let Link::Disk(child) = link else { unreachable!("children are written first") };
+                let &Link::Disk(child) = link else { unreachable!("children are written first") };
                 put_u16(&mut out, k.len() as u16);
-                put_u64(&mut out, *child);
+                put_u64(&mut out, child);
                 out.extend_from_slice(k);
             }
         }
@@ -208,9 +211,9 @@ fn child_index(cs: &[(Vec<u8>, Link)], key: &[u8]) -> usize {
     cs.partition_point(|(k, _)| k.as_slice() <= key).saturating_sub(1)
 }
 
+#[derive(Clone)]
 pub(crate) struct Tree {
     root: Option<Link>,
-    arena: Vec<Node>,
     /// 改动时被复制走的已提交节点。提交之后它们不再被新根引用。
     pub(crate) replaced: Vec<u64>,
     bs: usize,
@@ -218,25 +221,32 @@ pub(crate) struct Tree {
 
 impl Tree {
     pub(crate) fn open(root: Option<u64>, block_size: usize) -> Self {
-        Tree { root: root.map(Link::Disk), arena: Vec::new(), replaced: Vec::new(), bs: block_size }
+        Tree { root: root.map(Link::Disk), replaced: Vec::new(), bs: block_size }
     }
 
-    fn load<D: BlockDevice + ?Sized>(&self, dev: &D, link: Link) -> Result<Cow<'_, Node>, UnitError> {
+    /// 同一时刻的树，给读者用：共享全部节点，以后两边各改各的。
+    pub(crate) fn view(&self) -> Tree {
+        Tree { root: self.root.clone(), replaced: Vec::new(), bs: self.bs }
+    }
+
+    fn load<D: BlockDevice + ?Sized>(&self, dev: &D, link: &Link) -> Result<Arc<Node>, UnitError> {
         match link {
-            Link::Mem(i) => Ok(Cow::Borrowed(&self.arena[i])),
-            Link::Disk(b) => Ok(Cow::Owned(read_node(dev, b, self.bs)?.0)),
+            Link::Mem(n) => Ok(n.clone()),
+            Link::Disk(b) => Ok(Arc::new(read_node(dev, *b, self.bs)?.0)),
         }
     }
 
     pub(crate) fn get<D: BlockDevice + ?Sized>(&self, dev: &D, key: &[u8]) -> Result<Option<Vec<u8>>, UnitError> {
-        let Some(mut link) = self.root else { return Ok(None) };
+        let Some(root) = &self.root else { return Ok(None) };
+        let mut node = self.load(dev, root)?;
         loop {
-            match &*self.load(dev, link)? {
+            let next = match &*node {
                 Node::Leaf(es) => {
                     return Ok(es.binary_search_by(|(k, _)| k.as_slice().cmp(key)).ok().map(|i| es[i].1.clone()));
                 }
-                Node::Branch(cs) => link = cs[child_index(cs, key)].1,
-            }
+                Node::Branch(cs) => self.load(dev, &cs[child_index(cs, key)].1)?,
+            };
+            node = next;
         }
     }
 
@@ -246,13 +256,13 @@ impl Tree {
         D: BlockDevice + ?Sized,
         F: FnMut(&[u8], &[u8]) -> Result<bool, UnitError>,
     {
-        if let Some(root) = self.root {
+        if let Some(root) = &self.root {
             self.scan_rec(dev, root, from, f)?;
         }
         Ok(())
     }
 
-    fn scan_rec<D, F>(&self, dev: &D, link: Link, from: &[u8], f: &mut F) -> Result<bool, UnitError>
+    fn scan_rec<D, F>(&self, dev: &D, link: &Link, from: &[u8], f: &mut F) -> Result<bool, UnitError>
     where
         D: BlockDevice + ?Sized,
         F: FnMut(&[u8], &[u8]) -> Result<bool, UnitError>,
@@ -268,7 +278,7 @@ impl Tree {
             }
             Node::Branch(cs) => {
                 for (_, child) in &cs[child_index(cs, from)..] {
-                    if !self.scan_rec(dev, *child, from, f)? {
+                    if !self.scan_rec(dev, child, from, f)? {
                         return Ok(false);
                     }
                 }
@@ -288,13 +298,13 @@ impl Tree {
 
     /// 不大于 `key` 的最后一个条目。
     pub(crate) fn floor<D: BlockDevice + ?Sized>(&self, dev: &D, key: &[u8]) -> Result<Option<Entry>, UnitError> {
-        match self.root {
+        match &self.root {
             Some(root) => self.floor_rec(dev, root, key),
             None => Ok(None),
         }
     }
 
-    fn floor_rec<D: BlockDevice + ?Sized>(&self, dev: &D, link: Link, key: &[u8]) -> Result<Option<Entry>, UnitError> {
+    fn floor_rec<D: BlockDevice + ?Sized>(&self, dev: &D, link: &Link, key: &[u8]) -> Result<Option<Entry>, UnitError> {
         match &*self.load(dev, link)? {
             Node::Leaf(es) => {
                 let n = es.partition_point(|(k, _)| k.as_slice() <= key);
@@ -303,7 +313,7 @@ impl Tree {
             Node::Branch(cs) => {
                 // 下界可能因为删除而不再是子树里实际存在的键，所以落空时往左找。
                 for j in (0..=child_index(cs, key)).rev() {
-                    if let Some(hit) = self.floor_rec(dev, cs[j].1, key)? {
+                    if let Some(hit) = self.floor_rec(dev, &cs[j].1, key)? {
                         return Ok(Some(hit));
                     }
                 }
@@ -318,43 +328,31 @@ impl Tree {
         D: BlockDevice + ?Sized,
         F: FnMut(u64),
     {
-        if let Some(root) = self.root {
+        if let Some(root) = &self.root {
             self.visit_rec(dev, root, f)?;
         }
         Ok(())
     }
 
-    fn visit_rec<D, F>(&self, dev: &D, link: Link, f: &mut F) -> Result<(), UnitError>
+    fn visit_rec<D, F>(&self, dev: &D, link: &Link, f: &mut F) -> Result<(), UnitError>
     where
         D: BlockDevice + ?Sized,
         F: FnMut(u64),
     {
         let node = match link {
-            Link::Mem(i) => Cow::Borrowed(&self.arena[i]),
+            Link::Mem(n) => Cow::Borrowed(&**n),
             Link::Disk(b) => {
-                let (node, blocks) = read_node(dev, b, self.bs)?;
+                let (node, blocks) = read_node(dev, *b, self.bs)?;
                 blocks.into_iter().for_each(&mut *f);
                 Cow::Owned(node)
             }
         };
         if let Node::Branch(cs) = &*node {
             for (_, child) in cs {
-                self.visit_rec(dev, *child, f)?;
+                self.visit_rec(dev, child, f)?;
             }
         }
         Ok(())
-    }
-
-    fn make_mem<D: BlockDevice + ?Sized>(&mut self, dev: &D, link: Link) -> Result<usize, UnitError> {
-        match link {
-            Link::Mem(i) => Ok(i),
-            Link::Disk(b) => {
-                let (node, blocks) = read_node(dev, b, self.bs)?;
-                self.replaced.extend(blocks);
-                self.arena.push(node);
-                Ok(self.arena.len() - 1)
-            }
-        }
     }
 
     pub(crate) fn insert<D: BlockDevice + ?Sized>(
@@ -364,107 +362,26 @@ impl Tree {
         value: Vec<u8>,
     ) -> Result<(), UnitError> {
         assert!(key.len() <= u16::MAX as usize && value.len() <= u16::MAX as usize, "tree entry too large");
-        let mut root = match self.root {
-            Some(link) => self.make_mem(dev, link)?,
-            None => {
-                self.arena.push(Node::Leaf(Vec::new()));
-                self.arena.len() - 1
+        let bs = self.bs;
+        let mut root = self.root.take().unwrap_or_else(|| Link::Mem(Arc::new(Node::Leaf(Vec::new()))));
+        let split = insert_rec(dev, bs, &mut self.replaced, &mut root, key, value);
+        let mut split = match split {
+            Ok(s) => s,
+            Err(e) => {
+                self.root = Some(root);
+                return Err(e);
             }
         };
-        let mut split = self.insert_rec(dev, root, key, value)?;
         // 根分裂了就长高一层；新根本身也可能放不下，继续分。
         while !split.is_empty() {
-            let mut children = vec![(Vec::new(), Link::Mem(root))];
+            let mut children = vec![(Vec::new(), root)];
             children.extend(split);
-            self.arena.push(Node::Branch(children));
-            root = self.arena.len() - 1;
-            split = self.split_if_full(root);
+            let mut node = Node::Branch(children);
+            split = split_if_full(&mut node, bs);
+            root = Link::Mem(Arc::new(node));
         }
-        self.root = Some(Link::Mem(root));
+        self.root = Some(root);
         Ok(())
-    }
-
-    fn insert_rec<D: BlockDevice + ?Sized>(
-        &mut self,
-        dev: &D,
-        idx: usize,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> Result<Vec<(Vec<u8>, Link)>, UnitError> {
-        match &mut self.arena[idx] {
-            Node::Leaf(es) => match es.binary_search_by(|(k, _)| k.as_slice().cmp(&key)) {
-                Ok(i) => es[i].1 = value,
-                Err(i) => es.insert(i, (key, value)),
-            },
-            Node::Branch(cs) => {
-                let i = child_index(cs, &key);
-                let child = cs[i].1;
-                let ci = self.make_mem(dev, child)?;
-                let split = self.insert_rec(dev, ci, key, value)?;
-                let Node::Branch(cs) = &mut self.arena[idx] else { unreachable!() };
-                cs[i].1 = Link::Mem(ci);
-                for (j, entry) in split.into_iter().enumerate() {
-                    cs.insert(i + 1 + j, entry);
-                }
-            }
-        }
-        Ok(self.split_if_full(idx))
-    }
-
-    /// 节点超出一块时，从左到右尽量装满一块地切成几段，后面各段成为新节点。返回新节点的下界和链接。
-    ///
-    /// 叶子里单独就超过一块的条目自成一段（这样的节点跨多个块存放）。分支每段至少留两个孩子，
-    /// 否则分隔键很长时，根每长高一层还是同样多的长键，永远分不完。
-    fn split_if_full(&mut self, idx: usize) -> Vec<(Vec<u8>, Link)> {
-        let cap = self.bs - HEADER;
-        let node = &self.arena[idx];
-        let min = match node {
-            Node::Leaf(_) => 1,
-            Node::Branch(_) => 2,
-        };
-        if node.body_len() <= cap || node.len() < 2 * min {
-            return Vec::new();
-        }
-        let sizes = node.entry_sizes();
-        let mut starts = Vec::new();
-        if sizes.iter().all(|&s| s * 3 <= cap) {
-            // 常见情况：对半分。条目都不超过容量的三分之一，两半一定都放得下，
-            // 而且之后的插入不会立刻又把满的一半撑破。
-            starts.push(half(&sizes));
-        } else {
-            // 有大条目：从左到右尽量装满一块。
-            let (mut used, mut count) = (0, 0);
-            for (i, &s) in sizes.iter().enumerate() {
-                if count >= min && used + s > cap {
-                    starts.push(i);
-                    (used, count) = (0, 0);
-                }
-                used += s;
-                count += 1;
-            }
-            if count < min {
-                starts.pop();
-            }
-        }
-        let mut pieces = Vec::new();
-        for &at in starts.iter().rev() {
-            let (piece, sep) = match &mut self.arena[idx] {
-                Node::Leaf(es) => {
-                    let right = es.split_off(at);
-                    let sep = separator(&es[at - 1].0, &right[0].0);
-                    (Node::Leaf(right), sep)
-                }
-                Node::Branch(cs) => {
-                    let right = cs.split_off(at);
-                    let sep = right[0].0.clone();
-                    (Node::Branch(right), sep)
-                }
-            };
-            self.arena.push(piece);
-            pieces.push((sep, Link::Mem(self.arena.len() - 1)));
-        }
-        pieces.reverse();
-        pieces
     }
 
     /// 删除一个键，返回它是否存在。
@@ -472,86 +389,195 @@ impl Tree {
         if self.get(dev, key)?.is_none() {
             return Ok(false);
         }
-        let root = self.make_mem(dev, self.root.expect("non-empty"))?;
-        self.remove_rec(dev, root, key)?;
-        self.root = Some(Link::Mem(root));
-        // 根变空就成为空树；根只剩一个孩子就降一层。
-        while let Some(Link::Mem(i)) = self.root {
-            match &self.arena[i] {
-                n if n.is_empty() => self.root = None,
-                Node::Branch(cs) if cs.len() == 1 => self.root = Some(cs[0].1),
-                _ => break,
-            }
+        let mut root = self.root.take().expect("non-empty");
+        if let Err(e) = remove_rec(dev, self.bs, &mut self.replaced, &mut root, key) {
+            self.root = Some(root);
+            return Err(e);
         }
+        // 根变空就成为空树；根只剩一个孩子就降一层。
+        let mut root = Some(root);
+        while let Some(Link::Mem(n)) = &root {
+            root = match &**n {
+                n if n.is_empty() => None,
+                Node::Branch(cs) if cs.len() == 1 => Some(cs[0].1.clone()),
+                _ => break,
+            };
+        }
+        self.root = root;
         Ok(true)
     }
 
-    fn remove_rec<D: BlockDevice + ?Sized>(&mut self, dev: &D, idx: usize, key: &[u8]) -> Result<(), UnitError> {
-        let descend = match &mut self.arena[idx] {
-            Node::Leaf(es) => {
-                if let Ok(i) = es.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                    es.remove(i);
-                }
-                None
-            }
-            Node::Branch(cs) => {
-                let i = child_index(cs, key);
-                Some((i, cs[i].1))
-            }
-        };
-        if let Some((i, child)) = descend {
-            let ci = self.make_mem(dev, child)?;
-            self.remove_rec(dev, ci, key)?;
-            let empty = self.arena[ci].is_empty();
-            let Node::Branch(cs) = &mut self.arena[idx] else { unreachable!() };
-            if empty {
-                cs.remove(i);
-            } else {
-                cs[i].1 = Link::Mem(ci);
-            }
-        }
-        Ok(())
-    }
-
     /// 把内存里的节点写到新分配的块，返回新根（空树为 `None`）。之后树里只剩盘上节点。
-    pub(crate) fn flush<D, A>(&mut self, dev: &mut D, alloc: &mut A, generation: u64) -> Result<Option<u64>, UnitError>
+    /// 失败时树不变（已经分配、写下的块由调用者收回）。
+    pub(crate) fn flush<D, A>(&mut self, dev: &D, alloc: &mut A, generation: u64) -> Result<Option<u64>, UnitError>
     where
         D: BlockDevice + ?Sized,
         A: FnMut() -> Result<u64, UnitError>,
     {
-        let root = match self.root {
+        let root = match &self.root {
             None => None,
-            Some(Link::Disk(b)) => Some(b),
-            Some(Link::Mem(i)) => Some(self.flush_rec(dev, alloc, generation, i)?),
+            Some(Link::Disk(b)) => Some(*b),
+            Some(Link::Mem(n)) => Some(flush_rec(dev, self.bs, alloc, generation, n)?),
         };
         self.root = root.map(Link::Disk);
-        self.arena.clear();
         Ok(root)
     }
+}
 
-    fn flush_rec<D, A>(&mut self, dev: &mut D, alloc: &mut A, generation: u64, idx: usize) -> Result<u64, UnitError>
-    where
-        D: BlockDevice + ?Sized,
-        A: FnMut() -> Result<u64, UnitError>,
-    {
-        let mut node = core::mem::replace(&mut self.arena[idx], Node::Leaf(Vec::new()));
-        if let Node::Branch(cs) = &mut node {
-            for (_, link) in cs.iter_mut() {
-                if let Link::Mem(ci) = *link {
-                    *link = Link::Disk(self.flush_rec(dev, alloc, generation, ci)?);
-                }
+/// 要改的节点：盘上的先读进内存（原来的块记进 `replaced`），被别人共享着的先复制一份。
+fn node_mut<'a, D: BlockDevice + ?Sized>(
+    dev: &D,
+    bs: usize,
+    replaced: &mut Vec<u64>,
+    link: &'a mut Link,
+) -> Result<&'a mut Node, UnitError> {
+    if let Link::Disk(b) = *link {
+        let (node, blocks) = read_node(dev, b, bs)?;
+        replaced.extend(blocks);
+        *link = Link::Mem(Arc::new(node));
+    }
+    match link {
+        Link::Mem(n) => Ok(Arc::make_mut(n)),
+        Link::Disk(_) => unreachable!("just loaded"),
+    }
+}
+
+fn insert_rec<D: BlockDevice + ?Sized>(
+    dev: &D,
+    bs: usize,
+    replaced: &mut Vec<u64>,
+    link: &mut Link,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<Vec<(Vec<u8>, Link)>, UnitError> {
+    let node = node_mut(dev, bs, replaced, link)?;
+    match node {
+        Node::Leaf(es) => match es.binary_search_by(|(k, _)| k.as_slice().cmp(&key)) {
+            Ok(i) => es[i].1 = value,
+            Err(i) => es.insert(i, (key, value)),
+        },
+        Node::Branch(cs) => {
+            let i = child_index(cs, &key);
+            let split = insert_rec(dev, bs, replaced, &mut cs[i].1, key, value)?;
+            for (j, entry) in split.into_iter().enumerate() {
+                cs.insert(i + 1 + j, entry);
             }
         }
-        let mut blocks = Vec::new();
-        for _ in 0..blocks_for(node.body_len(), self.bs) {
-            blocks.push(alloc()?);
-        }
-        let buf = encode(&node, generation, &blocks, self.bs);
-        for (b, part) in blocks.iter().zip(buf.chunks(self.bs)) {
-            dev.write_at(b * self.bs as u64, part).map_err(|_| UnitError::Device)?;
-        }
-        Ok(blocks[0])
     }
+    Ok(split_if_full(node, bs))
+}
+
+/// 节点超出一块时，从左到右尽量装满一块地切成几段，后面各段成为新节点。返回新节点的下界和链接。
+///
+/// 叶子里单独就超过一块的条目自成一段（这样的节点跨多个块存放）。分支每段至少留两个孩子，
+/// 否则分隔键很长时，根每长高一层还是同样多的长键，永远分不完。
+fn split_if_full(node: &mut Node, bs: usize) -> Vec<(Vec<u8>, Link)> {
+    let cap = bs - HEADER;
+    let min = match node {
+        Node::Leaf(_) => 1,
+        Node::Branch(_) => 2,
+    };
+    if node.body_len() <= cap || node.len() < 2 * min {
+        return Vec::new();
+    }
+    let sizes = node.entry_sizes();
+    let mut starts = Vec::new();
+    if sizes.iter().all(|&s| s * 3 <= cap) {
+        // 常见情况：对半分。条目都不超过容量的三分之一，两半一定都放得下，
+        // 而且之后的插入不会立刻又把满的一半撑破。
+        starts.push(half(&sizes));
+    } else {
+        // 有大条目：从左到右尽量装满一块。
+        let (mut used, mut count) = (0, 0);
+        for (i, &s) in sizes.iter().enumerate() {
+            if count >= min && used + s > cap {
+                starts.push(i);
+                (used, count) = (0, 0);
+            }
+            used += s;
+            count += 1;
+        }
+        if count < min {
+            starts.pop();
+        }
+    }
+    let mut pieces = Vec::new();
+    for &at in starts.iter().rev() {
+        let (piece, sep) = match node {
+            Node::Leaf(es) => {
+                let right = es.split_off(at);
+                let sep = separator(&es[at - 1].0, &right[0].0);
+                (Node::Leaf(right), sep)
+            }
+            Node::Branch(cs) => {
+                let right = cs.split_off(at);
+                let sep = right[0].0.clone();
+                (Node::Branch(right), sep)
+            }
+        };
+        pieces.push((sep, Link::Mem(Arc::new(piece))));
+    }
+    pieces.reverse();
+    pieces
+}
+
+fn remove_rec<D: BlockDevice + ?Sized>(
+    dev: &D,
+    bs: usize,
+    replaced: &mut Vec<u64>,
+    link: &mut Link,
+    key: &[u8],
+) -> Result<(), UnitError> {
+    match node_mut(dev, bs, replaced, link)? {
+        Node::Leaf(es) => {
+            if let Ok(i) = es.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                es.remove(i);
+            }
+        }
+        Node::Branch(cs) => {
+            let i = child_index(cs, key);
+            remove_rec(dev, bs, replaced, &mut cs[i].1, key)?;
+            let empty = matches!(&cs[i].1, Link::Mem(n) if n.is_empty());
+            if empty {
+                cs.remove(i);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把内存里的节点（连同它下面的内存节点）写到新分配的块，返回它的块号。节点本身不变：
+/// 别的读者可能还拿着它。
+fn flush_rec<D, A>(dev: &D, bs: usize, alloc: &mut A, generation: u64, node: &Node) -> Result<u64, UnitError>
+where
+    D: BlockDevice + ?Sized,
+    A: FnMut() -> Result<u64, UnitError>,
+{
+    let written;
+    let node = match node {
+        Node::Branch(cs) => {
+            let mut out = Vec::with_capacity(cs.len());
+            for (k, link) in cs {
+                let child = match link {
+                    Link::Disk(b) => *b,
+                    Link::Mem(n) => flush_rec(dev, bs, alloc, generation, n)?,
+                };
+                out.push((k.clone(), Link::Disk(child)));
+            }
+            written = Node::Branch(out);
+            &written
+        }
+        leaf => leaf,
+    };
+    let mut blocks = Vec::new();
+    for _ in 0..blocks_for(node.body_len(), bs) {
+        blocks.push(alloc()?);
+    }
+    let buf = encode(node, generation, &blocks, bs);
+    for (b, part) in blocks.iter().zip(buf.chunks(bs)) {
+        dev.write_at(b * bs as u64, part).map_err(|_| UnitError::Device)?;
+    }
+    Ok(blocks[0])
 }
 
 #[cfg(test)]
@@ -581,7 +607,7 @@ mod tests {
 
     #[test]
     fn matches_a_btreemap_through_flushes() {
-        let mut dev = MemDevice::new(4096 * 4096, BS as u32);
+        let dev = MemDevice::new(4096 * 4096, BS as u32);
         let mut next = 1u64;
         let mut alloc = || {
             next += 1;
@@ -600,7 +626,7 @@ mod tests {
                 let k = key(i * 7 + round);
                 assert_eq!(t.remove(&dev, &k).unwrap(), model.remove(&k).is_some());
             }
-            t.flush(&mut dev, &mut alloc, round as u64).unwrap();
+            t.flush(&dev, &mut alloc, round as u64).unwrap();
             let expect: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             assert_eq!(collect(&t, &dev), expect);
         }
@@ -615,12 +641,12 @@ mod tests {
             assert!(t.remove(&dev, &k).unwrap());
         }
         assert!(collect(&t, &dev).is_empty());
-        assert_eq!(t.flush(&mut dev, &mut alloc, 9).unwrap(), None);
+        assert_eq!(t.flush(&dev, &mut alloc, 9).unwrap(), None);
     }
 
     #[test]
     fn entries_larger_than_a_block_get_their_own_nodes() {
-        let mut dev = MemDevice::new(4096 * 4096, BS as u32);
+        let dev = MemDevice::new(4096 * 4096, BS as u32);
         let mut next = 1u64;
         // 故意隔一个块分配，确认多块节点不需要连续的块。
         let mut alloc = || {
@@ -638,14 +664,14 @@ mod tests {
             t.insert(&dev, k.clone(), v.clone()).unwrap();
             model.insert(k, v);
             if i % 50 == 49 {
-                t.flush(&mut dev, &mut alloc, i as u64).unwrap();
+                t.flush(&dev, &mut alloc, i as u64).unwrap();
             }
         }
         for k in model.keys().step_by(4).cloned().collect::<Vec<_>>() {
             assert!(t.remove(&dev, &k).unwrap());
             model.remove(&k);
         }
-        t.flush(&mut dev, &mut alloc, 999).unwrap();
+        t.flush(&dev, &mut alloc, 999).unwrap();
         let expect: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(collect(&t, &dev), expect);
         let mut blocks = Vec::new();
@@ -656,10 +682,10 @@ mod tests {
 
     #[test]
     fn a_damaged_node_is_reported() {
-        let mut dev = MemDevice::new(64 * 4096, BS as u32);
+        let dev = MemDevice::new(64 * 4096, BS as u32);
         let mut t = Tree::open(None, BS);
         t.insert(&dev, b"a".to_vec(), b"1".to_vec()).unwrap();
-        let root = t.flush(&mut dev, &mut || Ok(5), 1).unwrap().unwrap();
+        let root = t.flush(&dev, &mut || Ok(5), 1).unwrap().unwrap();
         dev.write_at(root * BS as u64 + 100, &[1]).unwrap();
         assert_eq!(Tree::open(Some(root), BS).get(&dev, b"a"), Err(UnitError::Corrupt));
     }

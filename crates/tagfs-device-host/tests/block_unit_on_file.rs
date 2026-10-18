@@ -11,8 +11,10 @@ fn a_unit_in_a_file_survives_reopening() {
     let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     {
         let dev = FileDevice::create(&path, 8 << 20, 4096).unwrap();
-        let mut unit = BlockUnit::format(dev, UnitId([5; 16])).unwrap();
-        unit.apply(&[Change::Create { id, tags: vec![Tag::new("user", "name", "big")], content: content.clone() }])
+        let unit = BlockUnit::format(dev, UnitId([5; 16])).unwrap();
+        let stage = unit.stage().unwrap();
+        unit.write_staged(stage, 0, &content).unwrap();
+        unit.apply(&[Change::Create { id, tags: vec![Tag::new("user", "name", "big")], content: Some(stage) }])
             .unwrap();
     }
     let unit = BlockUnit::open(FileDevice::open(&path, 4096, false).unwrap()).unwrap();

@@ -37,7 +37,9 @@ impl core::fmt::Display for DeviceError {
 
 impl core::error::Error for DeviceError {}
 
-pub trait BlockDevice {
+/// 块设备。可以被多个线程同时读写：不重叠的范围互不影响，和宿主上按偏移读写文件（`pread`/`pwrite`）
+/// 一样；同一范围上的并发写由使用者自己避免。
+pub trait BlockDevice: Send + Sync {
     /// 设备的物理块大小（字节）；分配按它对齐。
     fn block_size(&self) -> u32;
 
@@ -48,17 +50,17 @@ pub trait BlockDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError>;
 
     /// 把 `buf` 写到 `offset`。返回时不保证已持久化，见 [`BlockDevice::flush`]。
-    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError>;
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), DeviceError>;
 
     /// 返回时，之前所有写入都已持久化。
-    fn flush(&mut self) -> Result<(), DeviceError>;
+    fn flush(&self) -> Result<(), DeviceError>;
 
     /// 告诉设备这段范围不再使用。内容随后读出来是什么不作保证。
-    fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError>;
+    fn trim(&self, offset: u64, len: u64) -> Result<(), DeviceError>;
 
     /// 把容量扩到至少 `capacity` 字节，新增部分读出来是零。能扩容的设备（如宿主机上的单文件）实现它；
     /// 默认不支持。
-    fn grow(&mut self, capacity: u64) -> Result<(), DeviceError> {
+    fn grow(&self, capacity: u64) -> Result<(), DeviceError> {
         let _ = capacity;
         Err(DeviceError::Unsupported)
     }

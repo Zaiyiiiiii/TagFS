@@ -10,6 +10,7 @@
 //! | 准备记录 | `06` 事务 片号 | 记录的一片 |
 //! | 已提交事务 | `07` 事务 | 事务描述 |
 //! | 附加记录 | `08` 任意 | 任意（上层单元自用） |
+//! | 暂存 | `09` 对象编号 | 空 |
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -27,6 +28,14 @@ pub(crate) const PREPARED: u8 = 6;
 pub(crate) const COMMITTED: u8 = 7;
 /// 建在块格式单元之上的单元（如目录单元）自己的记录，键和值由它决定。
 pub(crate) const AUX: u8 = 8;
+/// 暂存的内容：一个还没有实体引用的对象（引用数为 0），编号就是暂存的编号。
+pub(crate) const STAGED: u8 = 9;
+
+pub(crate) fn staged(o: u64) -> Vec<u8> {
+    let mut k = vec![STAGED];
+    k.extend_from_slice(&o.to_be_bytes());
+    k
+}
 
 pub(crate) fn aux(key: &[u8]) -> Vec<u8> {
     let mut k = vec![AUX];

@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
-use tagfs_core::{Change, EntityId, EntityRecord, Probe, Tag, TxnId, TxnInfo, UnitError};
+use tagfs_core::{Change, EntityId, EntityRecord, Probe, StageId, Tag, TxnId, TxnInfo, UnitError};
 use tagfs_device::BlockDevice;
 
 use crate::codec::{self, Reader, VALUE_STR, put_escaped_open, put_ns_key, put_tag, put_u64, put_value};
@@ -225,6 +225,24 @@ impl<D: BlockDevice + ?Sized> View<'_, D> {
             Ok(true)
         })?;
         if found { decode_prepared(&raw).map(Some) } else { Ok(None) }
+    }
+
+    /// 暂存对应的对象；不存在时报错。
+    pub(crate) fn staged(&self, stage: StageId) -> Result<u64, UnitError> {
+        match self.tree.get(self.dev, &keys::staged(stage.0))? {
+            Some(_) => Ok(stage.0),
+            None => Err(UnitError::UnknownStage(stage)),
+        }
+    }
+
+    /// 全部暂存。
+    pub(crate) fn stages(&self) -> Result<Vec<StageId>, UnitError> {
+        let mut out = Vec::new();
+        self.tree.scan_prefix(self.dev, &[keys::STAGED], &mut |k, _| {
+            out.push(StageId(Reader::new(&k[1..]).be_u64()?));
+            Ok(true)
+        })?;
+        Ok(out)
     }
 
     pub(crate) fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {

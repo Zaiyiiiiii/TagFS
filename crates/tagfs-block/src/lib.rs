@@ -5,10 +5,19 @@
 //! - 块 0、块 1：两份超级块，按提交号交替写。挂载时取校验通过、提交号最大的那份。
 //! - 其余的块：树节点、对象内容、空闲表，全部写时复制，没有固定位置。
 //!
-//! 一次提交：先写数据块和新的树节点、新的空闲表，刷盘；再写超级块，刷盘。超级块写完就是提交点，
+//! 一次提交：先写树节点和新的空闲表，刷盘；再写超级块，刷盘。超级块写完就是提交点，
 //! 断电后要么是旧的状态，要么是新的状态。
 //!
-//! 被替换下来的块在提交之后才能重新分配，并且要等持有旧快照的读者都结束。
+//! 内存里有一个“当前版本”（一棵树的根）：读者拿着某个版本读，不加锁，也不挡写者。写者一次一个，
+//! 在当前版本上改出新版本再公布。
+//!
+//! - 元数据修改（[`Unit::apply`] 等）改完就提交，提交之后才公布。
+//! - 内容写入不提交：数据在锁外直接写进新分配的块，再回到锁里把这些块登记进对象、公布新版本。
+//!   这些登记在下一次提交（[`Unit::sync`]、任何元数据修改）时随树一起落盘；之前断电，
+//!   新写的块在盘上的空闲表里仍是空闲的，单元回到上一次提交的状态。
+//!
+//! 被替换下来的块要等两件事才能再分配：盘上最近一次提交不再引用它（否则断电后会读到别的内容），
+//! 并且持有旧版本的读者都结束了。
 
 #![no_std]
 
@@ -26,30 +35,32 @@ mod work;
 mod tests;
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::{Ref, RefCell};
 use core::fmt;
 
-use tagfs_core::{Change, EntityId, EntityRecord, Probe, Snapshot, TxnId, TxnInfo, Unit, UnitError, UnitId};
+use tagfs_core::{Change, EntityId, EntityRecord, Probe, Snapshot, StageId, TxnId, TxnInfo, Unit, UnitError, UnitId};
 use tagfs_device::BlockDevice;
+use tagfs_sync::{Mutex, MutexGuard};
 
 use crate::codec::{Reader, put_u32, put_u64};
 use crate::crc::crc32c;
 use crate::extent::ExtentSet;
 use crate::tree::Tree;
-use crate::view::View;
-use crate::work::Work;
+use crate::view::{Extent, View};
+use crate::work::{Work, WritePlan};
 
 const MAGIC: &[u8; 8] = b"TAGFSBLK";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// 支持的最小块大小。树的单个条目上限由它决定。
 pub const MIN_BLOCK_SIZE: u32 = 4096;
 const MIN_BLOCKS: u64 = 16;
 /// 扩容时至少加这么多块（16 MiB）。
 const GROW_MIN_BLOCKS: u64 = 4096;
+/// 在锁外复制对象内容时一次搬多少块。
+const COPY_CHUNK_BLOCKS: u64 = 64;
 
 /// 打开或格式化失败的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,23 +165,11 @@ pub enum Aux {
 /// 一条附加记录：键和值。
 pub type AuxRecord = (Vec<u8>, Vec<u8>);
 
-/// 内容的来源，按偏移分段读取，不必整个放进内存。可能被从头再读一遍（提交因扩容重做时）。
-pub trait Source {
-    /// 从 `offset` 读到 `buf`，返回读到的字节数；0 表示结束。
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError>;
-}
-
-/// 用 `source` 的全部内容替换实体 `id` 的内容。
-pub struct Fill<'a> {
-    pub id: EntityId,
-    pub source: &'a mut dyn Source,
-}
-
 /// 一次提交的全部内容，见 [`BlockUnit::commit_batch`]。
 #[derive(Default)]
 pub struct Batch<'a> {
-    /// 先做：替换这些实体的内容。
-    pub fills: Vec<Fill<'a>>,
+    /// 先做：这些实体的内容换成暂存的内容，暂存随之用掉。
+    pub adopt: &'a [(EntityId, StageId)],
     /// 实体的修改，按顺序应用。
     pub changes: &'a [Change],
     /// 附加记录的改动，在修改之后应用。
@@ -180,31 +179,133 @@ pub struct Batch<'a> {
     pub finish: Option<(TxnId, bool)>,
 }
 
-/// 快照登记：提交号 → 持有它的读者数。
-type Readers = Rc<RefCell<BTreeMap<u64, usize>>>;
+/// 释放了、暂时还不能再分配的块。
+#[derive(Clone, Debug)]
+struct Released {
+    /// 从这个版本起不再引用它们。
+    epoch: u64,
+    blocks: ExtentSet,
+    /// 最近一次提交还引用它们：下一次提交之后才算空闲。
+    after_commit: bool,
+}
 
-pub struct BlockUnit<D: BlockDevice> {
-    dev: Rc<RefCell<D>>,
-    bs: usize,
+/// 写者的状态。一次改动失败时整个恢复成改动前的样子，所以要能便宜地复制（树只复制根）。
+#[derive(Clone)]
+pub(crate) struct State {
+    /// 最近一次提交的超级块（块数可能因扩容而更新）。
     sb: Super,
+    pub(crate) tree: Tree,
+    pub(crate) next_object: u64,
     /// 可以分配的块。
-    free: ExtentSet,
+    pub(crate) free: ExtentSet,
+    /// 最近一次提交之后才分配的块：盘上的状态没有引用它们。
+    pub(crate) fresh: ExtentSet,
+    /// 已经分配、正在锁外写入、还没登记的块。
+    pub(crate) inflight: ExtentSet,
+    pending: Vec<Released>,
     /// 当前空闲表占用的块。
     free_list: Vec<u64>,
-    /// 已经释放、但可能还有旧快照在读的块：释放时的提交号 → 块。
-    quarantine: Vec<(u64, ExtentSet)>,
-    readers: Readers,
+    /// 当前公布的版本号。
+    epoch: u64,
+    /// 有没提交的改动。
+    dirty: bool,
     /// 写超级块出错后不知道盘上是哪个状态，不再接受写入。
     broken: bool,
+}
+
+/// 读者看到的当前版本，和持有各个版本的读者数。
+struct Current {
+    tree: Tree,
+    epoch: u64,
+    readers: BTreeMap<u64, usize>,
+}
+
+struct Shared<D> {
+    dev: D,
+    bs: usize,
+    unit: UnitId,
+    current: Mutex<Current>,
+    state: Mutex<State>,
+}
+
+pub struct BlockUnit<D: BlockDevice> {
+    s: Arc<Shared<D>>,
+}
+
+/// 登记一个读者持有某个版本；放掉时注销。
+struct Pin<D: BlockDevice> {
+    s: Arc<Shared<D>>,
+    epoch: u64,
+}
+
+impl<D: BlockDevice> Drop for Pin<D> {
+    fn drop(&mut self) {
+        let mut cur = self.s.current.lock();
+        if let Some(n) = cur.readers.get_mut(&self.epoch) {
+            *n -= 1;
+            if *n == 0 {
+                cur.readers.remove(&self.epoch);
+            }
+        }
+    }
 }
 
 fn device_err<T>(r: Result<T, tagfs_device::DeviceError>) -> Result<T, UnitError> {
     r.map_err(|_| UnitError::Device)
 }
 
+/// 一次大块写入在锁外写好之前分配的块，不用了就直接还回去（它们从没被登记过）。
+fn unreserve(st: &mut State, blocks: &[(u64, u64)]) {
+    for &(s, l) in blocks {
+        st.inflight.remove_overlap(s, l);
+        st.fresh.remove_overlap(s, l);
+        st.free.insert(s, l);
+    }
+}
+
+/// 一次改动的收尾：本次释放的块按“从下一个版本起不再引用”记下，树里被复制走的盘上节点也算释放。
+fn settle<D: BlockDevice>(mut w: Work<'_, D>) {
+    for b in core::mem::take(&mut w.s.tree.replaced) {
+        w.release(b, 1);
+    }
+    let epoch = w.s.epoch + 1;
+    for (blocks, after_commit) in [(w.durable, true), (w.young, false)] {
+        if !blocks.is_empty() {
+            w.s.pending.push(Released { epoch, blocks, after_commit });
+        }
+    }
+}
+
 impl<D: BlockDevice + 'static> BlockUnit<D> {
+    fn new(dev: D, sb: Super, free: ExtentSet, free_list: Vec<u64>) -> Self {
+        let bs = sb.block_size as usize;
+        let tree = Tree::open((sb.root != 0).then_some(sb.root), bs);
+        let state = State {
+            tree: tree.view(),
+            next_object: sb.next_object,
+            free,
+            fresh: ExtentSet::new(),
+            inflight: ExtentSet::new(),
+            pending: Vec::new(),
+            free_list,
+            epoch: 0,
+            dirty: false,
+            broken: false,
+            sb: sb.clone(),
+        };
+        BlockUnit {
+            s: Arc::new(Shared {
+                dev,
+                bs,
+                unit: sb.unit,
+                current: Mutex::new(Current { tree, epoch: 0, readers: BTreeMap::new() }),
+                state: Mutex::new(state),
+            }),
+        }
+    }
+
     /// 在设备上建一个空单元，覆盖原有内容。
-    pub fn format(mut dev: D, unit: UnitId) -> Result<Self, OpenError> {
+    pub fn format(dev: D, unit: UnitId) -> Result<Self, OpenError> {
         let bs = dev.block_size();
         if bs < MIN_BLOCK_SIZE || !bs.is_power_of_two() {
             return Err(OpenError::BadBlockSize);
@@ -219,22 +320,17 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         }
         let mut free = ExtentSet::new();
         free.insert(2, blocks - 2);
-        let mut me = BlockUnit {
-            dev: Rc::new(RefCell::new(dev)),
-            bs: bs as usize,
-            sb: Super { block_size: bs, blocks, unit, generation: 0, root: 0, free_head: 0, next_object: 1 },
-            free,
-            free_list: Vec::new(),
-            quarantine: Vec::new(),
-            readers: Rc::default(),
-            broken: false,
-        };
-        let w = me.work();
-        me.commit(w)?;
+        let sb = Super { block_size: bs, blocks, unit, generation: 0, root: 0, free_head: 0, next_object: 1 };
+        let me = Self::new(dev, sb, free, Vec::new());
+        {
+            let mut st = me.lock();
+            st.dirty = true;
+            me.commit(&mut st)?;
+        }
         Ok(me)
     }
 
-    /// 挂载已有的单元。
+    /// 挂载已有的单元。断电前没用上的暂存在这里回收。
     pub fn open(dev: D) -> Result<Self, OpenError> {
         let bs = dev.block_size();
         if bs < MIN_BLOCK_SIZE || !bs.is_power_of_two() {
@@ -259,193 +355,397 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
             return Err(OpenError::TooSmall);
         }
         let (free, free_list) = read_free_list(&dev, bs as usize, sb.free_head, sb.blocks)?;
-        Ok(BlockUnit {
-            dev: Rc::new(RefCell::new(dev)),
-            bs: bs as usize,
-            sb,
-            free,
-            free_list,
-            quarantine: Vec::new(),
-            readers: Rc::default(),
-            broken: false,
-        })
+        let me = Self::new(dev, sb, free, free_list);
+        me.drop_unclaimed_stages()?;
+        Ok(me)
+    }
+
+    /// 没有准备记录引用的暂存：上次没用上就断了，回收。
+    fn drop_unclaimed_stages(&self) -> Result<(), UnitError> {
+        let claimed: BTreeSet<StageId> = self
+            .prepared()?
+            .iter()
+            .flat_map(|(_, changes)| changes.iter())
+            .filter_map(|c| match c {
+                Change::Create { content: Some(s), .. } => Some(*s),
+                _ => None,
+            })
+            .collect();
+        let stale: Vec<StageId> = self.stages()?.into_iter().filter(|s| !claimed.contains(s)).collect();
+        if !stale.is_empty() {
+            self.transact(|w| stale.iter().try_for_each(|s| w.discard_stage(*s)))?;
+        }
+        Ok(())
     }
 
     /// 底层设备（测试里用来模拟断电）。
-    pub fn device(&self) -> Ref<'_, D> {
-        self.dev.borrow()
+    pub fn device(&self) -> &D {
+        &self.s.dev
     }
 
-    /// 当前提交号。
+    /// 最近一次提交的提交号。
     pub fn generation(&self) -> u64 {
-        self.sb.generation
+        self.lock().sb.generation
     }
 
-    /// 空闲块数（含等待旧快照结束的）。
+    /// 空闲块数（含等待旧版本的读者结束、等待下一次提交的）。
     pub fn free_blocks(&self) -> u64 {
-        self.free.blocks() + self.quarantine.iter().map(|(_, s)| s.blocks()).sum::<u64>()
+        let st = self.lock();
+        st.free.blocks() + st.pending.iter().map(|r| r.blocks.blocks()).sum::<u64>()
     }
 
-    /// 已经释放、但还有旧快照在读、暂时不能再分配的块数。
+    /// 已经释放、暂时还不能再分配的块数。
     pub fn pinned_blocks(&self) -> u64 {
-        self.quarantine.iter().map(|(_, s)| s.blocks()).sum()
+        self.lock().pending.iter().map(|r| r.blocks.blocks()).sum()
     }
 
     /// 全部块数（含两份超级块）。
     pub fn total_blocks(&self) -> u64 {
-        self.sb.blocks
+        self.lock().sb.blocks
     }
 
-    fn root(&self) -> Option<u64> {
-        (self.sb.root != 0).then_some(self.sb.root)
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.s.state.lock()
     }
 
-    fn work(&self) -> Work<D> {
-        Work {
-            dev: self.dev.clone(),
-            bs: self.bs as u64,
-            tree: Tree::open(self.root(), self.bs),
-            free: self.free.clone(),
-            fresh: ExtentSet::new(),
-            released: ExtentSet::new(),
-            next_object: self.sb.next_object,
+    fn bs(&self) -> u64 {
+        self.s.bs as u64
+    }
+
+    fn work<'a>(&'a self, st: &'a mut State) -> Work<'a, D> {
+        Work { dev: &self.s.dev, bs: self.bs(), s: st, durable: ExtentSet::new(), young: ExtentSet::new() }
+    }
+
+    /// 在当前版本上读，读的期间登记为读者。
+    fn view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
+        let (tree, _pin) = self.pin_current();
+        f(&View { tree: &tree, dev: &self.s.dev, bs: self.bs() })
+    }
+
+    fn pin_current(&self) -> (Tree, Pin<D>) {
+        let mut cur = self.s.current.lock();
+        let epoch = cur.epoch;
+        *cur.readers.entry(epoch).or_default() += 1;
+        (cur.tree.view(), Pin { s: self.s.clone(), epoch })
+    }
+
+    /// 把改好的状态公布成新版本。
+    fn publish(&self, st: &mut State) {
+        st.epoch += 1;
+        {
+            let mut cur = self.s.current.lock();
+            cur.tree = st.tree.view();
+            cur.epoch = st.epoch;
+        }
+        self.reclaim(st);
+    }
+
+    /// 不再有人引用的已释放块，放回可分配的空间。返回是否放回了什么。
+    fn reclaim(&self, st: &mut State) -> bool {
+        let oldest = self.s.current.lock().readers.keys().next().copied();
+        let published = st.epoch;
+        let (ready, waiting): (Vec<_>, Vec<_>) = core::mem::take(&mut st.pending)
+            .into_iter()
+            .partition(|r| !r.after_commit && r.epoch <= published && oldest.is_none_or(|o| o >= r.epoch));
+        st.pending = waiting;
+        let any = !ready.is_empty();
+        for r in ready {
+            st.free.extend(&r.blocks);
+        }
+        any
+    }
+
+    /// 在写者状态上做一次改动，`commit` 时随即提交，然后公布。失败时状态不变；空间不够时，
+    /// 先收回能收回的块，再试着扩容，然后整个重做。
+    fn run<T>(
+        &self,
+        st: &mut State,
+        commit: bool,
+        f: &mut impl FnMut(&mut Work<'_, D>) -> Result<T, UnitError>,
+    ) -> Result<T, UnitError> {
+        loop {
+            if st.broken {
+                return Err(UnitError::Device);
+            }
+            let saved = st.clone();
+            let mut w = self.work(st);
+            let r = match f(&mut w) {
+                Ok(t) => {
+                    settle(w);
+                    st.dirty = true;
+                    if commit { self.commit(st).map(|()| t) } else { Ok(t) }
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok(t) => {
+                    self.publish(st);
+                    return Ok(t);
+                }
+                Err(e) => {
+                    let broken = st.broken;
+                    *st = saved;
+                    st.broken |= broken;
+                    if e == UnitError::NoSpace && (self.reclaim(st) || self.grow(st)) {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let tree = Tree::open(self.root(), self.bs);
-        let dev = self.dev.borrow();
-        f(&View { tree: &tree, dev: &*dev, bs: self.bs as u64 })
+    /// 一次不提交的改动（内容写入）。
+    fn update<T>(&self, mut f: impl FnMut(&mut Work<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
+        let mut st = self.lock();
+        self.run(&mut st, false, &mut f)
     }
 
-    /// 把工作区写成新的提交。失败时单元状态不变。
-    fn commit(&mut self, mut w: Work<D>) -> Result<(), UnitError> {
-        if self.broken {
+    /// 一次随即提交的改动（元数据修改）。
+    fn transact<T>(&self, mut f: impl FnMut(&mut Work<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
+        let mut st = self.lock();
+        self.run(&mut st, true, &mut f)
+    }
+
+    /// 把写者状态写成新的提交。失败时调用者负责恢复状态。
+    fn commit(&self, st: &mut State) -> Result<(), UnitError> {
+        if st.broken {
             return Err(UnitError::Device);
         }
-        let generation = self.sb.generation + 1;
+        let dev = &self.s.dev;
+        let bs = self.s.bs;
+        let generation = st.sb.generation + 1;
         let root = {
-            let mut dev = self.dev.borrow_mut();
-            let (free, fresh) = (&mut w.free, &mut w.fresh);
-            w.tree.flush(&mut *dev, &mut || alloc_one(free, fresh), generation)?
+            let (free, fresh) = (&mut st.free, &mut st.fresh);
+            st.tree.flush(dev, &mut || alloc_one(free, fresh), generation)?
         };
-        for b in core::mem::take(&mut w.tree.replaced) {
-            w.release(b, 1);
-        }
-        for &b in &self.free_list {
-            w.release(b, 1);
+        // 旧的空闲表在这次提交之后就没人引用了。
+        let mut retired = ExtentSet::new();
+        for &b in &st.free_list {
+            retired.insert(b, 1);
         }
 
-        // 空闲表本身也要占块：先分配，再把分配后的空闲集合写进去。
-        let per = free_list_per_block(self.bs);
+        // 空闲表本身也要占块：先分配，再把分配后的空闲集合写进去。正在锁外写入的块在盘上也算空闲：
+        // 它们还没被登记，断电之后没人引用。
+        let per = free_list_per_block(bs);
         let mut list_blocks = Vec::new();
         let persisted = loop {
-            let mut all = w.free.clone();
-            all.extend(&w.released);
-            for (_, q) in &self.quarantine {
-                all.extend(q);
+            let mut all = st.free.clone();
+            all.extend(&retired);
+            all.extend(&st.inflight);
+            for r in &st.pending {
+                all.extend(&r.blocks);
             }
             if list_blocks.len() >= all.count().div_ceil(per) {
                 break all;
             }
-            list_blocks.push(alloc_one(&mut w.free, &mut w.fresh)?);
+            list_blocks.push(alloc_one(&mut st.free, &mut st.fresh)?);
         };
-        {
-            let mut dev = self.dev.borrow_mut();
-            let extents: Vec<(u64, u64)> = persisted.iter().collect();
-            let mut parts = extents.chunks(per);
-            for (i, &b) in list_blocks.iter().enumerate() {
-                let part = parts.next().unwrap_or(&[]);
-                let next = list_blocks.get(i + 1).copied().unwrap_or(0);
-                let mut buf = vec![0u8; 4];
-                put_u32(&mut buf, part.len() as u32);
-                put_u64(&mut buf, next);
-                for &(s, l) in part {
-                    put_u64(&mut buf, s);
-                    put_u64(&mut buf, l);
-                }
-                buf.resize(self.bs, 0);
-                let crc = crc32c(&buf[4..]);
-                buf[..4].copy_from_slice(&crc.to_le_bytes());
-                device_err(dev.write_at(b * self.bs as u64, &buf))?;
+        let extents: Vec<(u64, u64)> = persisted.iter().collect();
+        let mut parts = extents.chunks(per);
+        for (i, &b) in list_blocks.iter().enumerate() {
+            let part = parts.next().unwrap_or(&[]);
+            let next = list_blocks.get(i + 1).copied().unwrap_or(0);
+            let mut buf = vec![0u8; 4];
+            put_u32(&mut buf, part.len() as u32);
+            put_u64(&mut buf, next);
+            for &(s, l) in part {
+                put_u64(&mut buf, s);
+                put_u64(&mut buf, l);
             }
-            device_err(dev.flush())?;
+            buf.resize(bs, 0);
+            let crc = crc32c(&buf[4..]);
+            buf[..4].copy_from_slice(&crc.to_le_bytes());
+            device_err(dev.write_at(b * bs as u64, &buf))?;
         }
+        device_err(dev.flush())?;
 
         let sb = Super {
             generation,
             root: root.unwrap_or(0),
             free_head: list_blocks.first().copied().unwrap_or(0),
-            next_object: w.next_object,
-            ..self.sb.clone()
+            next_object: st.next_object,
+            ..st.sb.clone()
         };
-        {
-            let mut dev = self.dev.borrow_mut();
-            let slot = generation % 2;
-            let written = dev.write_at(slot * self.bs as u64, &sb.encode(self.bs)).and_then(|_| dev.flush());
-            if written.is_err() {
-                self.broken = true;
-                return Err(UnitError::Device);
-            }
+        let slot = generation % 2;
+        if dev.write_at(slot * bs as u64, &sb.encode(bs)).and_then(|_| dev.flush()).is_err() {
+            st.broken = true;
+            return Err(UnitError::Device);
         }
 
-        self.sb = sb;
-        self.free = w.free;
-        self.free_list = list_blocks;
-        if !w.released.is_empty() {
-            self.quarantine.push((generation, w.released));
+        st.sb = sb;
+        st.free_list = list_blocks;
+        for r in &mut st.pending {
+            r.after_commit = false;
         }
-        self.reclaim();
+        if !retired.is_empty() {
+            st.pending.push(Released { epoch: 0, blocks: retired, after_commit: false });
+        }
+        st.fresh = st.inflight.clone();
+        st.dirty = false;
         Ok(())
-    }
-
-    /// 没有读者再看得到的已释放块，放回可分配的空闲空间。
-    fn reclaim(&mut self) {
-        let oldest = self.readers.borrow().keys().next().copied();
-        let (ready, waiting): (Vec<_>, Vec<_>) =
-            core::mem::take(&mut self.quarantine).into_iter().partition(|(g, _)| oldest.is_none_or(|o| o >= *g));
-        self.quarantine = waiting;
-        for (_, set) in ready {
-            self.free.extend(&set);
-        }
-    }
-
-    /// 在工作区里做改动并提交。空间不够时，设备能扩容就扩容后整个重做。
-    fn update(&mut self, mut f: impl FnMut(&mut Work<D>) -> Result<(), UnitError>) -> Result<(), UnitError> {
-        loop {
-            let mut w = self.work();
-            match f(&mut w).and_then(|()| self.commit(w)) {
-                Err(UnitError::NoSpace) if self.grow() => continue,
-                r => return r,
-            }
-        }
     }
 
     /// 设备扩容（至少翻倍），新增的块进空闲空间。下一次提交把新的大小写进超级块；在那之前断电，
     /// 超级块还是旧的大小，多出来的部分没人用。返回是否扩成了。
-    fn grow(&mut self) -> bool {
-        let bs = self.bs as u64;
-        let old = self.sb.blocks;
+    fn grow(&self, st: &mut State) -> bool {
+        let bs = self.bs();
+        let old = st.sb.blocks;
         let want = old.saturating_mul(2).max(old + GROW_MIN_BLOCKS);
-        let mut dev = self.dev.borrow_mut();
-        if dev.grow(want.saturating_mul(bs)).is_err() {
+        if self.s.dev.grow(want.saturating_mul(bs)).is_err() {
             return false;
         }
-        let now = dev.capacity() / bs;
+        let now = self.s.dev.capacity() / bs;
         if now <= old {
             return false;
         }
-        self.free.insert(old, now - old);
-        self.sb.blocks = now;
+        st.free.insert(old, now - old);
+        st.sb.blocks = now;
         true
+    }
+
+    /// 写对象的内容：小的直接在锁里改；大的先在锁里分配新块，锁外写数据，再回锁里登记。
+    fn write_object(&self, o: u64, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        let Some(plan) = self.update(|w| w.plan_write(o, offset, data))? else { return Ok(()) };
+        let written = self.fill_blocks(&plan, offset, data);
+        let mut st = self.lock();
+        let r = written.and_then(|()| self.run(&mut st, false, &mut |w| w.finish_write(&plan)));
+        if r.is_err() {
+            unreserve(&mut st, &plan.blocks);
+        }
+        r
+    }
+
+    /// 锁外：把数据写进安排好的新块。只写了一部分的首尾两块，先读出原来的内容再补上。
+    fn fill_blocks(&self, plan: &WritePlan, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        let bs = self.bs();
+        let dev = &self.s.dev;
+        let end = offset + data.len() as u64;
+        let (b0, b1) = (plan.b0, plan.b1);
+        let read_old = |phys: Option<u64>| -> Result<Vec<u8>, UnitError> {
+            let mut block = vec![0u8; bs as usize];
+            if let Some(p) = phys {
+                device_err(dev.read_at(p * bs, &mut block))?;
+            }
+            Ok(block)
+        };
+        // 落在第 `b` 块里的那部分数据，覆盖到这块原来的内容上。
+        let overlay = |b: u64, block: &mut [u8]| {
+            let (lo, hi) = (offset.max(b * bs), end.min((b + 1) * bs));
+            block[(lo - b * bs) as usize..(hi - b * bs) as usize]
+                .copy_from_slice(&data[(lo - offset) as usize..(hi - offset) as usize]);
+        };
+        let mut head = None;
+        if !offset.is_multiple_of(bs) {
+            let mut block = read_old(plan.head)?;
+            overlay(b0, &mut block);
+            head = Some(block);
+        }
+        let mut tail = None;
+        if !end.is_multiple_of(bs) && !(b1 - 1 == b0 && head.is_some()) {
+            let mut block = read_old(plan.tail)?;
+            overlay(b1 - 1, &mut block);
+            tail = Some(block);
+        }
+        let mut logical = b0;
+        for &(start, len) in &plan.blocks {
+            let mut j = logical;
+            while j < logical + len {
+                let phys = (start + (j - logical)) * bs;
+                if j == b0
+                    && let Some(block) = &head
+                {
+                    device_err(dev.write_at(phys, block))?;
+                    j += 1;
+                    continue;
+                }
+                if j == b1 - 1
+                    && let Some(block) = &tail
+                {
+                    device_err(dev.write_at(phys, block))?;
+                    j += 1;
+                    continue;
+                }
+                // 中间整块的数据在 `data` 里是连续的一段，直接写。
+                let stop = (logical + len).min(if tail.is_some() { b1 - 1 } else { b1 });
+                let from = (j * bs - offset) as usize;
+                let to = (stop * bs - offset) as usize;
+                device_err(dev.write_at(phys, &data[from..to]))?;
+                j = stop;
+            }
+            logical += len;
+        }
+        Ok(())
+    }
+
+    /// 实体要改内容，返回它独占的对象。对象被共享着就复制一份给它：大的在锁外复制数据。
+    fn own(&self, id: &EntityId) -> Result<u64, UnitError> {
+        type Copying = (u64, u64, Vec<Extent>, Vec<(u64, u64)>);
+        let step: Result<u64, Copying> = self.update(|w| {
+            Ok(match w.own_small(id)? {
+                Ok(o) => Ok(o),
+                Err(o) => {
+                    let size = w.object(o)?.size;
+                    let extents = w.extents(o)?;
+                    let blocks = w.alloc(extents.iter().map(|e| e.2).sum())?;
+                    for &(s, l) in &blocks {
+                        w.s.inflight.insert(s, l);
+                    }
+                    Err((o, size, extents, blocks))
+                }
+            })
+        })?;
+        let (from, size, extents, blocks) = match step {
+            Ok(o) => return Ok(o),
+            Err(c) => c,
+        };
+        let copied = self.copy_extents(&extents, &blocks);
+        let mut st = self.lock();
+        let r = copied.and_then(|layout| {
+            self.run(&mut st, false, &mut |w| {
+                if w.entity_object(id)? != from {
+                    // 调用者没有排好同一实体上的写入。
+                    return Err(UnitError::Corrupt);
+                }
+                w.switch_to_copy(id, from, size, &layout)
+            })
+        });
+        if r.is_err() {
+            unreserve(&mut st, &blocks);
+        }
+        r
+    }
+
+    /// 锁外：把区段的数据依次搬进新分配的块，返回新的区段（逻辑块、物理块、块数）。
+    fn copy_extents(&self, extents: &[Extent], blocks: &[(u64, u64)]) -> Result<Vec<Extent>, UnitError> {
+        let bs = self.bs();
+        let dev = &self.s.dev;
+        let mut layout = Vec::new();
+        let mut dst = blocks.iter().copied();
+        let (mut at, mut room) = (0u64, 0u64);
+        for &(logical, phys, n) in extents {
+            let mut done = 0;
+            while done < n {
+                if room == 0 {
+                    (at, room) = dst.next().ok_or(UnitError::Corrupt)?;
+                }
+                let chunk = (n - done).min(room).min(COPY_CHUNK_BLOCKS);
+                let mut buf = vec![0u8; (chunk * bs) as usize];
+                device_err(dev.read_at((phys + done) * bs, &mut buf))?;
+                device_err(dev.write_at(at * bs, &buf))?;
+                layout.push((logical + done, at, chunk));
+                (at, room, done) = (at + chunk, room - chunk, done + chunk);
+            }
+        }
+        Ok(layout)
     }
 
     /// 把一批修改、附加记录和准备记录的了结作为一次提交原子地完成。
     /// 建在块格式单元之上的单元（如目录单元）靠它把自己的记录和实体的修改放进同一次提交。
-    pub fn commit_batch(&mut self, batch: &mut Batch<'_>) -> Result<(), UnitError> {
-        self.update(|w| {
-            for fill in batch.fills.iter_mut() {
-                w.fill(&fill.id, &mut *fill.source)?;
+    pub fn commit_batch(&self, batch: &Batch<'_>) -> Result<(), UnitError> {
+        self.transact(|w| {
+            for (id, stage) in batch.adopt {
+                w.adopt(id, *stage)?;
             }
             for c in batch.changes {
                 w.apply(c)?;
@@ -467,60 +767,82 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         })
     }
 
+    /// 现有的全部暂存。
+    pub fn stages(&self) -> Result<Vec<StageId>, UnitError> {
+        self.view(|v| v.stages())
+    }
+
     /// 读一条附加记录。
     pub fn aux_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, UnitError> {
-        let tree = Tree::open(self.root(), self.bs);
-        tree.get(&*self.dev.borrow(), &keys::aux(key))
+        self.view(|v| v.tree.get(v.dev, &keys::aux(key)))
     }
 
     /// 键以 `prefix` 开头的全部附加记录，按键排序。
     pub fn aux_list(&self, prefix: &[u8]) -> Result<Vec<AuxRecord>, UnitError> {
-        let tree = Tree::open(self.root(), self.bs);
-        let mut out = Vec::new();
-        tree.scan_prefix(&*self.dev.borrow(), &keys::aux(prefix), &mut |k, v| {
-            out.push((k[1..].to_vec(), v.to_vec()));
-            Ok(true)
-        })?;
-        Ok(out)
+        self.view(|v| {
+            let mut out = Vec::new();
+            v.tree.scan_prefix(v.dev, &keys::aux(prefix), &mut |k, val| {
+                out.push((k[1..].to_vec(), val.to_vec()));
+                Ok(true)
+            })?;
+            Ok(out)
+        })
     }
 
-    /// 全面检查：每个块恰好属于超级块、树节点、对象内容、空闲表、空闲空间中的一种；
-    /// 对象引用数和引用它的实体数一致；实体的 Tag 和 Tag 索引一致。
+    /// 全面检查：每个块恰好属于超级块、树节点、对象内容、空闲表、空闲空间、待回收、正在写入中的一种；
+    /// 对象引用数和引用它的实体数一致（暂存的对象没有实体引用）；实体的 Tag 和 Tag 索引一致。
     pub fn verify(&self) -> Result<(), UnitError> {
+        // 在写者状态的一个瞬间上查：拿着那一刻的树和空间记账，登记为读者，之后锁外慢慢查。
+        let (tree, free, pending, inflight, free_list, blocks, next_object, _pin) = {
+            let st = self.lock();
+            let pin = {
+                let mut cur = self.s.current.lock();
+                *cur.readers.entry(st.epoch).or_default() += 1;
+                Pin { s: self.s.clone(), epoch: st.epoch }
+            };
+            let pending: Vec<ExtentSet> = st.pending.iter().map(|r| r.blocks.clone()).collect();
+            (
+                st.tree.view(),
+                st.free.clone(),
+                pending,
+                st.inflight.clone(),
+                st.free_list.clone(),
+                st.sb.blocks,
+                st.next_object,
+                pin,
+            )
+        };
         let mut used = ExtentSet::new();
         let claim = |s: u64, l: u64, used: &mut ExtentSet| -> Result<(), UnitError> {
-            if l == 0 || s + l > self.sb.blocks || used.overlaps(s, l) {
+            if l == 0 || s + l > blocks || used.overlaps(s, l) {
                 return Err(UnitError::Corrupt);
             }
             used.insert(s, l);
             Ok(())
         };
         claim(0, 2, &mut used)?;
-        for &b in &self.free_list {
+        for &b in &free_list {
             claim(b, 1, &mut used)?;
         }
-        for (s, l) in self.free.iter() {
-            claim(s, l, &mut used)?;
-        }
-        for (_, q) in &self.quarantine {
-            for (s, l) in q.iter() {
+        for set in pending.iter().chain([&free, &inflight]) {
+            for (s, l) in set.iter() {
                 claim(s, l, &mut used)?;
             }
         }
-        let tree = Tree::open(self.root(), self.bs);
-        let dev = self.dev.borrow();
+        let dev = &self.s.dev;
         let mut nodes = Vec::new();
-        tree.visit_nodes(&*dev, &mut |b| nodes.push(b))?;
+        tree.visit_nodes(dev, &mut |b| nodes.push(b))?;
         for b in nodes {
             claim(b, 1, &mut used)?;
         }
 
         let mut refs: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut staged = BTreeSet::new();
         let mut entity_tags = Vec::new();
         let mut index = Vec::new();
         let mut objects = Vec::new();
         let mut extents = Vec::new();
-        tree.scan(&*dev, &[], &mut |k, v| {
+        tree.scan(dev, &[], &mut |k, v| {
             match k[0] {
                 keys::ENTITY => *refs.entry(Reader::new(v).u64()?).or_default() += 1,
                 keys::ENTITY_TAG => {
@@ -531,10 +853,13 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                     let id = EntityId(k[k.len() - 16..].try_into().unwrap());
                     index.push((Reader::new(&k[1..k.len() - 16]).tag()?, id));
                 }
-                keys::OBJECT => objects.push((Reader::new(&k[1..]).be_u64()?, v.to_vec())),
+                keys::OBJECT => objects.push(Reader::new(&k[1..]).be_u64()?),
                 keys::EXTENT => {
                     let o = Reader::new(&k[1..]).be_u64()?;
                     extents.push(view::decode_extent(o, k, v)?);
+                }
+                keys::STAGED => {
+                    staged.insert(Reader::new(&k[1..]).be_u64()?);
                 }
                 keys::PREPARED | keys::COMMITTED | keys::AUX => {}
                 _ => return Err(UnitError::Corrupt),
@@ -546,20 +871,21 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         if entity_tags != index {
             return Err(UnitError::Corrupt);
         }
-        let v = View { tree: &tree, dev: &*dev, bs: self.bs as u64 };
-        if objects.len() != refs.len() {
+        let v = View { tree: &tree, dev, bs: self.bs() };
+        if objects.len() != refs.len() + staged.len() {
             return Err(UnitError::Corrupt);
         }
-        for (o, _) in &objects {
+        for o in &objects {
             let rec = v.object(*o)?;
-            if refs.get(o) != Some(&rec.refs) || *o >= self.sb.next_object {
+            let expect = if staged.contains(o) { None } else { refs.get(o) };
+            if rec.refs != expect.copied().unwrap_or(0) || *o >= next_object {
                 return Err(UnitError::Corrupt);
             }
         }
         for (_, p, n) in extents {
             claim(p, n, &mut used)?;
         }
-        if used.blocks() != self.sb.blocks {
+        if used.blocks() != blocks {
             return Err(UnitError::Corrupt);
         }
         Ok(())
@@ -621,57 +947,100 @@ fn read_free_list<D: BlockDevice + ?Sized>(
 
 impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     fn id(&self) -> UnitId {
-        self.sb.unit
+        self.s.unit
     }
 
     fn snapshot(&self) -> Box<dyn Snapshot> {
-        let generation = self.sb.generation;
-        *self.readers.borrow_mut().entry(generation).or_default() += 1;
-        Box::new(BlockSnapshot {
-            dev: self.dev.clone(),
-            tree: Tree::open(self.root(), self.bs),
-            bs: self.bs as u64,
-            generation,
-            readers: self.readers.clone(),
-        })
+        let (tree, pin) = self.pin_current();
+        Box::new(BlockSnapshot { tree, pin })
     }
 
-    fn apply(&mut self, changes: &[Change]) -> Result<(), UnitError> {
-        self.update(|w| changes.iter().try_for_each(|c| w.apply(c)))
+    fn write(&self, id: &EntityId, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        let o = self.own(id)?;
+        self.write_object(o, offset, data)
     }
 
-    fn prepare(&mut self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
-        self.update(|w| w.put_prepared(txn, changes))
+    fn set_len(&self, id: &EntityId, len: u64) -> Result<(), UnitError> {
+        let o = self.own(id)?;
+        self.update(|w| w.truncate_object(o, len))
+    }
+
+    fn sync(&self) -> Result<(), UnitError> {
+        let mut st = self.lock();
+        if !st.dirty {
+            return Ok(());
+        }
+        self.run(&mut st, true, &mut |_| Ok(()))
+    }
+
+    fn stage(&self) -> Result<StageId, UnitError> {
+        self.update(|w| w.new_stage())
+    }
+
+    fn write_staged(&self, stage: StageId, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+        let o = self.view(|v| v.staged(stage))?;
+        self.write_object(o, offset, data)
+    }
+
+    fn discard_staged(&self, stage: StageId) -> Result<(), UnitError> {
+        self.update(|w| w.discard_stage(stage))
+    }
+
+    fn apply(&self, changes: &[Change]) -> Result<(), UnitError> {
+        self.transact(|w| changes.iter().try_for_each(|c| w.apply(c)))
+    }
+
+    fn prepare(&self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
+        self.transact(|w| w.put_prepared(txn, changes))
     }
 
     fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError> {
-        self.with_view(|v| v.prepared())
+        self.view(|v| v.prepared())
     }
 
-    fn commit_prepared(&mut self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
-        let (_, changes) = self.with_view(|v| v.prepared_one(&txn))?.ok_or(UnitError::UnknownTxn(txn))?;
-        self.commit_batch(&mut Batch { changes: &changes, finish: Some((txn, as_primary)), ..Batch::default() })
+    fn commit_prepared(&self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
+        self.transact(|w| {
+            let (info, changes) = w.prepared_one(&txn)?.ok_or(UnitError::UnknownTxn(txn))?;
+            for c in &changes {
+                w.apply(c)?;
+            }
+            w.remove_prepared(&txn)?;
+            if as_primary {
+                w.put_committed(&info)?;
+            }
+            Ok(())
+        })
     }
 
-    fn abort_prepared(&mut self, txn: TxnId) -> Result<(), UnitError> {
-        self.update(|w| if w.remove_prepared(&txn)? { Ok(()) } else { Err(UnitError::UnknownTxn(txn)) })
+    fn abort_prepared(&self, txn: TxnId) -> Result<(), UnitError> {
+        self.transact(|w| {
+            let (_, changes) = w.prepared_one(&txn)?.ok_or(UnitError::UnknownTxn(txn))?;
+            w.remove_prepared(&txn)?;
+            // 它占着的暂存一并丢掉。
+            for c in &changes {
+                if let Change::Create { content: Some(stage), .. } = c {
+                    w.discard_stage(*stage)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {
-        self.with_view(|v| v.committed())
+        self.view(|v| v.committed())
     }
 
-    fn forget(&mut self, txn: TxnId) -> Result<(), UnitError> {
-        self.update(|w| w.remove_committed(&txn))
+    fn forget(&self, txn: TxnId) -> Result<(), UnitError> {
+        self.transact(|w| w.remove_committed(&txn))
     }
 
-    fn check(&mut self) -> Result<(), UnitError> {
+    fn check(&self) -> Result<(), UnitError> {
         self.verify()
     }
 
     fn describe(&self) -> Vec<(&'static str, alloc::string::String)> {
         use alloc::format;
-        let bs = self.bs as u64;
+        let bs = self.bs();
         vec![
             ("size", format!("{} bytes", self.total_blocks() * bs)),
             ("free", format!("{} bytes", self.free_blocks() * bs)),
@@ -681,29 +1050,13 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
 }
 
 struct BlockSnapshot<D: BlockDevice> {
-    dev: Rc<RefCell<D>>,
     tree: Tree,
-    bs: u64,
-    generation: u64,
-    readers: Readers,
+    pin: Pin<D>,
 }
 
 impl<D: BlockDevice> BlockSnapshot<D> {
     fn with_view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let dev = self.dev.borrow();
-        f(&View { tree: &self.tree, dev: &*dev, bs: self.bs })
-    }
-}
-
-impl<D: BlockDevice> Drop for BlockSnapshot<D> {
-    fn drop(&mut self) {
-        let mut readers = self.readers.borrow_mut();
-        if let Some(n) = readers.get_mut(&self.generation) {
-            *n -= 1;
-            if *n == 0 {
-                readers.remove(&self.generation);
-            }
-        }
+        f(&View { tree: &self.tree, dev: &self.pin.s.dev, bs: self.pin.s.bs as u64 })
     }
 }
 

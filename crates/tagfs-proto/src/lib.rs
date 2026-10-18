@@ -1,7 +1,16 @@
 //! 运行中的卷（`tagfs-volume`）和各工具之间的通信协议。
 //!
 //! 走本机套接字（POSIX 上是 Unix 域套接字，Windows 上是命名管道）。每条消息是一个帧：
-//! 4 字节小端长度，后面是内容。一条请求对应一条应答。
+//! 4 字节小端长度，后面是内容。
+//!
+//! 一般的请求一条对应一条应答。内容按分段流式传输，两边都只用固定大小的缓冲区，长度没有上限：
+//!
+//! - [`Request::Read`]：卷回若干条 [`Response::Bytes`]（每条至多 [`CHUNK`] 字节），最后一条
+//!   [`Response::Done`]（或中途出错时一条 [`Response::Error`]）。
+//! - [`Request::Write`]、[`Request::WriteStaged`]：请求之后客户端接着发数据帧（内容就是数据，每帧至多
+//!   [`CHUNK`] 字节），以一个空帧结束；卷收完之后回一条应答。
+//!
+//! 暂存（[`Request::Stage`]）属于发起它的连接：连接断开时没用上的暂存都丢掉。
 
 use std::io::{self, Read, Write};
 use std::ops::Bound;
@@ -10,8 +19,10 @@ use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, Name, Stream};
 use tagfs_core::{EntityId, Key, Namespace, Query, Tag, UnitId, Value};
 
+/// 内容分段传输时每段的大小。
+pub const CHUNK: usize = 1 << 20;
 /// 单个帧的上限，防止对方发来离谱的长度。
-const MAX_FRAME: u32 = 1 << 30;
+const MAX_FRAME: u32 = 64 << 20;
 
 /// 一个单元在卷里的登记：用哪个后端、在哪里、现在是否在线。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,16 +45,35 @@ pub struct EntityInfo {
     pub size: u64,
 }
 
-/// 事务里的一项操作。
+/// 事务里的一项元数据操作。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    Create { unit: Option<UnitId>, tags: Vec<Tag>, content: Vec<u8> },
-    Copy { from: EntityId, unit: Option<UnitId>, tags: Vec<Tag> },
-    Delete { id: EntityId },
-    AddTag { id: EntityId, tag: Tag },
-    RemoveTag { id: EntityId, tag: Tag },
-    Write { id: EntityId, offset: u64, data: Vec<u8> },
-    Truncate { id: EntityId, len: u64 },
+    /// 新建内容为空的实体。
+    Create {
+        unit: Option<UnitId>,
+        tags: Vec<Tag>,
+    },
+    /// 新建实体，内容是这个连接上写好的暂存，实体放在暂存所在的单元。
+    CreateFrom {
+        stage: u64,
+        tags: Vec<Tag>,
+    },
+    Copy {
+        from: EntityId,
+        unit: Option<UnitId>,
+        tags: Vec<Tag>,
+    },
+    Delete {
+        id: EntityId,
+    },
+    AddTag {
+        id: EntityId,
+        tag: Tag,
+    },
+    RemoveTag {
+        id: EntityId,
+        tag: Tag,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,12 +101,38 @@ pub enum Request {
     Get {
         id: EntityId,
     },
+    /// 从 `offset` 起读至多 `len` 字节（`u64::MAX` 表示读到末尾），流式应答。
     Read {
         id: EntityId,
         offset: u64,
-        len: u32,
+        len: u64,
     },
-    /// 一个事务：全部生效或全部不生效。
+    /// 从 `offset` 起写，数据随后流式发送。
+    Write {
+        id: EntityId,
+        offset: u64,
+    },
+    SetLen {
+        id: EntityId,
+        len: u64,
+    },
+    /// 让实体所在单元之前的写入都落盘。
+    Flush {
+        id: EntityId,
+    },
+    /// 新的一份暂存（`unit` 为空时由卷决定放在哪个单元），应答 [`Response::Staged`]。
+    Stage {
+        unit: Option<UnitId>,
+    },
+    /// 写暂存，数据随后流式发送。
+    WriteStaged {
+        stage: u64,
+        offset: u64,
+    },
+    DiscardStage {
+        stage: u64,
+    },
+    /// 一个元数据事务：全部生效或全部不生效。
     Apply {
         ops: Vec<Op>,
     },
@@ -90,9 +146,12 @@ pub enum Response {
     Unit(UnitId),
     Ids(Vec<EntityId>),
     Entity(EntityInfo),
+    /// 读到的一段内容。
     Bytes(Vec<u8>),
     /// `Apply` 的结果：每项操作一个，新建和复制给出新实体。
     Applied(Vec<Option<EntityId>>),
+    /// 新暂存在这个连接上的编号。
+    Staged(u64),
 }
 
 // ---- 编码 ----
@@ -345,18 +404,22 @@ impl Request {
                 e.u8(6);
                 e.id16(&id.0);
                 e.u64(*offset);
-                e.u32(*len);
+                e.u64(*len);
             }
             Request::Apply { ops } => {
                 e.u8(7);
                 e.u32(ops.len() as u32);
                 for op in ops {
                     match op {
-                        Op::Create { unit, tags, content } => {
+                        Op::Create { unit, tags } => {
                             e.u8(0);
                             e.opt_unit(unit);
                             e.tags(tags);
-                            e.bytes(content);
+                        }
+                        Op::CreateFrom { stage, tags } => {
+                            e.u8(5);
+                            e.u64(*stage);
+                            e.tags(tags);
                         }
                         Op::Copy { from, unit, tags } => {
                             e.u8(1);
@@ -373,19 +436,35 @@ impl Request {
                             e.id16(&id.0);
                             e.tag(tag);
                         }
-                        Op::Write { id, offset, data } => {
-                            e.u8(5);
-                            e.id16(&id.0);
-                            e.u64(*offset);
-                            e.bytes(data);
-                        }
-                        Op::Truncate { id, len } => {
-                            e.u8(6);
-                            e.id16(&id.0);
-                            e.u64(*len);
-                        }
                     }
                 }
+            }
+            Request::Write { id, offset } => {
+                e.u8(8);
+                e.id16(&id.0);
+                e.u64(*offset);
+            }
+            Request::SetLen { id, len } => {
+                e.u8(9);
+                e.id16(&id.0);
+                e.u64(*len);
+            }
+            Request::Flush { id } => {
+                e.u8(10);
+                e.id16(&id.0);
+            }
+            Request::Stage { unit } => {
+                e.u8(11);
+                e.opt_unit(unit);
+            }
+            Request::WriteStaged { stage, offset } => {
+                e.u8(12);
+                e.u64(*stage);
+                e.u64(*offset);
+            }
+            Request::DiscardStage { stage } => {
+                e.u8(13);
+                e.u64(*stage);
             }
         }
         e.0
@@ -404,23 +483,28 @@ impl Request {
                 Request::Query { query, after, limit: d.u32()? }
             }
             5 => Request::Get { id: d.entity()? },
-            6 => Request::Read { id: d.entity()?, offset: d.u64()?, len: d.u32()? },
+            6 => Request::Read { id: d.entity()?, offset: d.u64()?, len: d.u64()? },
             7 => {
                 let mut ops = Vec::new();
                 for _ in 0..d.u32()? {
                     ops.push(match d.u8()? {
-                        0 => Op::Create { unit: d.opt_unit()?, tags: d.tags()?, content: d.bytes()? },
+                        0 => Op::Create { unit: d.opt_unit()?, tags: d.tags()? },
                         1 => Op::Copy { from: d.entity()?, unit: d.opt_unit()?, tags: d.tags()? },
                         2 => Op::Delete { id: d.entity()? },
                         3 => Op::AddTag { id: d.entity()?, tag: d.tag()? },
                         4 => Op::RemoveTag { id: d.entity()?, tag: d.tag()? },
-                        5 => Op::Write { id: d.entity()?, offset: d.u64()?, data: d.bytes()? },
-                        6 => Op::Truncate { id: d.entity()?, len: d.u64()? },
+                        5 => Op::CreateFrom { stage: d.u64()?, tags: d.tags()? },
                         _ => return Err(bad()),
                     });
                 }
                 Request::Apply { ops }
             }
+            8 => Request::Write { id: d.entity()?, offset: d.u64()? },
+            9 => Request::SetLen { id: d.entity()?, len: d.u64()? },
+            10 => Request::Flush { id: d.entity()? },
+            11 => Request::Stage { unit: d.opt_unit()? },
+            12 => Request::WriteStaged { stage: d.u64()?, offset: d.u64()? },
+            13 => Request::DiscardStage { stage: d.u64()? },
             _ => return Err(bad()),
         };
         d.end()?;
@@ -492,6 +576,10 @@ impl Response {
                     }
                 }
             }
+            Response::Staged(stage) => {
+                e.u8(8);
+                e.u64(*stage);
+            }
         }
         e.0
     }
@@ -522,6 +610,7 @@ impl Response {
                     .map(|_| Ok(if d.u8()? == 1 { Some(d.entity()?) } else { None }))
                     .collect::<io::Result<_>>()?,
             ),
+            8 => Response::Staged(d.u64()?),
             _ => return Err(bad()),
         };
         d.end()?;
@@ -587,10 +676,69 @@ impl Client {
         Ok(Client { conn: Stream::connect(name)? })
     }
 
+    /// 一条请求、一条应答。流式的请求用 [`Client::read`]、[`Client::write`]、[`Client::write_staged`]。
     pub fn call(&mut self, req: &Request) -> io::Result<Response> {
         write_frame(&mut self.conn, &req.encode())?;
+        self.response()
+    }
+
+    fn response(&mut self) -> io::Result<Response> {
         let frame = read_frame(&mut self.conn)?.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         Response::decode(&frame)
+    }
+
+    /// 从 `offset` 起读至多 `len` 字节（`u64::MAX` 读到末尾），一段一段交给 `out`。
+    /// 返回读到的字节数；卷报错时为 `Ok(Err(原因))`。
+    pub fn read(
+        &mut self,
+        id: EntityId,
+        offset: u64,
+        len: u64,
+        out: &mut impl Write,
+    ) -> io::Result<Result<u64, String>> {
+        write_frame(&mut self.conn, &Request::Read { id, offset, len }.encode())?;
+        let mut n = 0;
+        loop {
+            match self.response()? {
+                Response::Bytes(b) => {
+                    out.write_all(&b)?;
+                    n += b.len() as u64;
+                }
+                Response::Done => return Ok(Ok(n)),
+                Response::Error(e) => return Ok(Err(e)),
+                _ => return Err(bad()),
+            }
+        }
+    }
+
+    /// 把 `src` 的全部内容从 `offset` 起写进实体，一段一段发送。
+    pub fn write(&mut self, id: EntityId, offset: u64, src: &mut impl Read) -> io::Result<Response> {
+        self.send(&Request::Write { id, offset }, src)
+    }
+
+    /// 把 `src` 的全部内容从 `offset` 起写进暂存，一段一段发送。
+    pub fn write_staged(&mut self, stage: u64, offset: u64, src: &mut impl Read) -> io::Result<Response> {
+        self.send(&Request::WriteStaged { stage, offset }, src)
+    }
+
+    fn send(&mut self, req: &Request, src: &mut impl Read) -> io::Result<Response> {
+        write_frame(&mut self.conn, &req.encode())?;
+        let mut buf = vec![0u8; CHUNK];
+        let failed = loop {
+            match src.read(&mut buf) {
+                Ok(0) => break None,
+                Ok(n) => write_frame(&mut self.conn, &buf[..n])?,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Some(e),
+            }
+        };
+        // 读本地的来源出错也要把流结束掉，连接才能接着用。
+        write_frame(&mut self.conn, &[])?;
+        let resp = self.response()?;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(resp),
+        }
     }
 }
 
@@ -625,16 +773,22 @@ mod tests {
                 limit: 10,
             },
             Request::Get { id },
-            Request::Read { id, offset: 7, len: 9 },
+            Request::Read { id, offset: 7, len: u64::MAX },
+            Request::Write { id, offset: 1 << 40 },
+            Request::SetLen { id, len: 3 },
+            Request::Flush { id },
+            Request::Stage { unit: Some(unit) },
+            Request::Stage { unit: None },
+            Request::WriteStaged { stage: 5, offset: 6 },
+            Request::DiscardStage { stage: 5 },
             Request::Apply {
                 ops: vec![
-                    Op::Create { unit: Some(unit), tags: vec![tag.clone(), Tag::flag("u", "f")], content: vec![1, 2] },
+                    Op::Create { unit: Some(unit), tags: vec![tag.clone(), Tag::flag("u", "f")] },
+                    Op::CreateFrom { stage: 9, tags: vec![tag.clone()] },
                     Op::Copy { from: id, unit: None, tags: vec![] },
                     Op::Delete { id },
                     Op::AddTag { id, tag: tag.clone() },
                     Op::RemoveTag { id, tag: tag.clone() },
-                    Op::Write { id, offset: 1, data: vec![9] },
-                    Op::Truncate { id, len: 0 },
                 ],
             },
         ];
@@ -665,6 +819,7 @@ mod tests {
             Response::Entity(EntityInfo { id, tags: vec![tag], size: 5 }),
             Response::Bytes(vec![1, 2, 3]),
             Response::Applied(vec![Some(id), None]),
+            Response::Staged(42),
         ];
         for r in resps {
             assert_eq!(Response::decode(&r.encode()).unwrap(), r);

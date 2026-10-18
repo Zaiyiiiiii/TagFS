@@ -1,0 +1,18 @@
+[package]
+name = "tagfs-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 用的锁：宿主上用会让出线程的锁，裸机上用自旋锁"
+
+[features]
+# 运行在宿主操作系统上：等锁时让出线程，而不是空转。
+std = ["dep:parking_lot"]
+
+[dependencies]
+lock_api = { version = "0.4", features = ["arc_lock"] }
+parking_lot = { version = "0.12", optional = true }
+spin = { version = "0.9", default-features = false, features = ["lock_api", "mutex", "spin_mutex", "rwlock"] }
+
+[lints]
+workspace = true

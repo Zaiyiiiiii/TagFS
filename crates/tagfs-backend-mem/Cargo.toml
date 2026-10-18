@@ -7,6 +7,7 @@ description = "TagFS 的内存后端：不持久化的存储单元，也是存�
 
 [dependencies]
 tagfs-core = { path = "../tagfs-core" }
+tagfs-sync = { path = "../tagfs-sync" }
 
 [lints]
 workspace = true

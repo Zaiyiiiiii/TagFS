@@ -7,6 +7,7 @@ description = "TagFS 的宿主机块设备：单个文件或裸盘"
 
 [dependencies]
 tagfs-device = { path = "../tagfs-device" }
+tagfs-sync = { path = "../tagfs-sync", features = ["std"] }
 
 [dev-dependencies]
 tagfs-block = { path = "../tagfs-block" }

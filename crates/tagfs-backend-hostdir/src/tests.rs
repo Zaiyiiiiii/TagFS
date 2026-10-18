@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tagfs_core::{Change, EntityId, IdSource, Tag, Unit, UnitError, UnitId};
@@ -19,7 +20,7 @@ impl IdSource for Counter {
     }
 }
 
-fn ids() -> Box<dyn IdSource> {
+fn ids() -> Box<dyn IdSource + Send> {
     Box::new(Counter(1000))
 }
 
@@ -47,6 +48,18 @@ fn fresh(name: &str) -> (PathBuf, DirUnit) {
     (root, unit)
 }
 
+/// 新建实体的修改：内容先写进暂存。
+fn new_entity(u: &dyn Unit, id: EntityId, tags: Vec<Tag>, data: &[u8]) -> Change {
+    let stage = u.stage().unwrap();
+    u.write_staged(stage, 0, data).unwrap();
+    Change::Create { id, tags, content: Some(stage) }
+}
+
+fn create(u: &dyn Unit, id: EntityId, tags: Vec<Tag>, data: &[u8]) {
+    let c = new_entity(u, id, tags, data);
+    u.apply(&[c]).unwrap();
+}
+
 fn content(u: &dyn Unit, id: &EntityId) -> Vec<u8> {
     let s = u.snapshot();
     let size = s.get(id).unwrap().unwrap().size;
@@ -67,6 +80,10 @@ fn by_path(u: &dyn Unit, path: &str) -> Option<EntityId> {
 /// 镜像里存的内容长度：路径实体的内容不应留在镜像里。
 fn image_size(u: &DirUnit, id: &EntityId) -> u64 {
     u.image().snapshot().get(id).unwrap().unwrap().size
+}
+
+fn staged_files(root: &std::path::Path) -> usize {
+    fs::read_dir(root.join(".tagfs/staged")).map_or(0, |d| d.count())
 }
 
 /// 等宿主改动的通知到达并同步进来。
@@ -100,41 +117,42 @@ fn existing_files_become_entities_with_their_paths() {
 
 #[test]
 fn a_path_creates_the_file_and_missing_directories() {
-    let (root, mut unit) = fresh("create");
-    unit.apply(&[Change::Create {
-        id: eid(1),
-        tags: vec![p("/abc/bcd/1.file"), Tag::new("user", "n", "x")],
-        content: b"data".to_vec(),
-    }])
-    .unwrap();
+    let (root, unit) = fresh("create");
+    let c = new_entity(&unit, eid(1), vec![p("/abc/bcd/1.file"), Tag::new("user", "n", "x")], b"data");
+    let Change::Create { content: Some(stage), .. } = c else { unreachable!() };
+    #[cfg(unix)]
+    let staged_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(unit.staged_file(stage)).unwrap());
+    unit.apply(&[c]).unwrap();
     assert_eq!(fs::read(root.join("abc/bcd/1.file")).unwrap(), b"data");
+    // 暂存文件直接改名成了目标文件，没有复制。
+    #[cfg(unix)]
+    assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(root.join("abc/bcd/1.file")).unwrap()), staged_inode);
     assert_eq!(content(&unit, &eid(1)), b"data");
     assert_eq!(image_size(&unit, &eid(1)), 0);
 
     // 没有路径的实体存在镜像里，宿主上看不到。
-    unit.apply(&[Change::Create { id: eid(2), tags: vec![], content: b"inside".to_vec() }]).unwrap();
+    create(&unit, eid(2), vec![], b"inside");
     assert_eq!(content(&unit, &eid(2)), b"inside");
     let mut names: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
     assert_eq!(names, [".tagfs", "abc"].map(std::ffi::OsString::from));
     assert!(!root.join(".tagfs/tmp").exists());
+    assert_eq!(staged_files(&root), 0);
 }
 
 #[test]
 fn writes_go_straight_to_the_host_file() {
-    let (root, mut unit) = fresh("direct");
+    let (root, unit) = fresh("direct");
     // 一个 16 MiB 的宿主文件，写一个字节、截短、再写。
     let big = vec![7u8; 16 << 20];
     fs::write(root.join("big.bin"), &big).unwrap();
     unit.rescan().unwrap();
     let id = by_path(&unit, "/big.bin").unwrap();
     let image_before = unit.image().total_blocks();
-    unit.apply(&[
-        Change::Write { id, offset: 5, data: b"X".to_vec() },
-        Change::Truncate { id, len: 10 << 20 },
-        Change::Write { id, offset: (12 << 20) - 1, data: b"Y".to_vec() },
-    ])
-    .unwrap();
+    unit.write(&id, 5, b"X").unwrap();
+    unit.set_len(&id, 10 << 20).unwrap();
+    unit.write(&id, (12 << 20) - 1, b"Y").unwrap();
+    unit.sync().unwrap();
     let now = fs::read(root.join("big.bin")).unwrap();
     assert_eq!(now.len(), 12 << 20);
     assert_eq!(now[5], b'X');
@@ -147,13 +165,13 @@ fn writes_go_straight_to_the_host_file() {
 
 #[test]
 fn changing_the_path_tag_moves_removes_or_materialises_the_file() {
-    let (root, mut unit) = fresh("move");
-    unit.apply(&[
-        Change::Create { id: eid(1), tags: vec![p("/a.txt")], content: b"one".to_vec() },
-        Change::Create { id: eid(2), tags: vec![p("/b.txt")], content: b"two".to_vec() },
-        Change::Create { id: eid(3), tags: vec![], content: b"three".to_vec() },
-    ])
-    .unwrap();
+    let (root, unit) = fresh("move");
+    let changes = [
+        new_entity(&unit, eid(1), vec![p("/a.txt")], b"one"),
+        new_entity(&unit, eid(2), vec![p("/b.txt")], b"two"),
+        new_entity(&unit, eid(3), vec![], b"three"),
+    ];
+    unit.apply(&changes).unwrap();
 
     // 改名：同一个实体，文件移过去，内容不进镜像。
     unit.apply(&[
@@ -186,13 +204,10 @@ fn changing_the_path_tag_moves_removes_or_materialises_the_file() {
     assert_eq!(fs::read(root.join("c.txt")).unwrap(), b"three");
     assert_eq!(image_size(&unit, &eid(3)), 0);
 
-    // 写、改名在同一次里：写进原文件，再移过去。
-    unit.apply(&[
-        Change::Write { id: eid(1), offset: 3, data: b"!".to_vec() },
-        Change::RemoveTag { id: eid(1), tag: p("/b.txt") },
-        Change::AddTag { id: eid(1), tag: p("/f.txt") },
-    ])
-    .unwrap();
+    // 写过再改名：写进原文件，移过去的是同一个文件。
+    unit.write(&eid(1), 3, b"!").unwrap();
+    unit.apply(&[Change::RemoveTag { id: eid(1), tag: p("/b.txt") }, Change::AddTag { id: eid(1), tag: p("/f.txt") }])
+        .unwrap();
     assert_eq!(fs::read(root.join("f.txt")).unwrap(), b"one!");
     unit.apply(&[Change::Delete { id: eid(3) }]).unwrap();
     assert!(!root.join("c.txt").exists());
@@ -201,10 +216,10 @@ fn changing_the_path_tag_moves_removes_or_materialises_the_file() {
 
 #[test]
 fn copies_follow_the_target_path() {
-    let (root, mut unit) = fresh("copy");
-    unit.apply(&[Change::Create { id: eid(1), tags: vec![p("/src")], content: b"payload".to_vec() }]).unwrap();
+    let (root, unit) = fresh("copy");
+    create(&unit, eid(1), vec![p("/src")], b"payload");
+    unit.write(&eid(1), 0, b"P").unwrap();
     unit.apply(&[
-        Change::Write { id: eid(1), offset: 0, data: b"P".to_vec() },
         Change::Copy { from: eid(1), id: eid(2), tags: vec![p("/dst")] },
         Change::Copy { from: eid(1), id: eid(3), tags: vec![] },
     ])
@@ -216,60 +231,59 @@ fn copies_follow_the_target_path() {
     assert_eq!(image_size(&unit, &eid(2)), 0);
 
     // 复制之后再改源：复制品不受影响。
-    unit.apply(&[
-        Change::Copy { from: eid(1), id: eid(4), tags: vec![p("/dst2")] },
-        Change::Write { id: eid(1), offset: 0, data: b"Q".to_vec() },
-    ])
-    .unwrap();
+    unit.apply(&[Change::Copy { from: eid(1), id: eid(4), tags: vec![p("/dst2")] }]).unwrap();
+    unit.write(&eid(1), 0, b"Q").unwrap();
     assert_eq!(fs::read(root.join("dst2")).unwrap(), b"Payload");
     assert_eq!(fs::read(root.join("src")).unwrap(), b"Qayload");
+    assert_eq!(content(&unit, &eid(3)), b"Payload");
     unit.image().verify().unwrap();
 }
 
 #[test]
 fn bad_or_taken_paths_change_nothing() {
-    let (root, mut unit) = fresh("guard");
+    let (root, unit) = fresh("guard");
     fs::write(root.join("outside-tagfs.txt"), b"x").unwrap();
     fs::write(root.join("file"), b"x").unwrap();
     unit.rescan().unwrap();
     let before = unit.snapshot().all().unwrap();
-    let try_path = |unit: &mut DirUnit, v: &str| {
-        unit.apply(&[
-            Change::Create { id: eid(50), tags: vec![], content: vec![] },
-            Change::Create { id: eid(51), tags: vec![p(v)], content: b"y".to_vec() },
-        ])
+    let try_path = |unit: &DirUnit, v: &str| {
+        let made = new_entity(unit, eid(51), vec![p(v)], b"y");
+        let r = unit.apply(&[Change::Create { id: eid(50), tags: vec![], content: None }, made.clone()]);
+        // 没用上的暂存原样留着，由调用者丢掉。
+        let Change::Create { content: Some(stage), .. } = made else { unreachable!() };
+        unit.discard_staged(stage).unwrap();
+        r
     };
     for bad in ["/../x", "/a/../../x", "relative", "/.tagfs/unit.img", "/a//b", "/a/"] {
-        assert_eq!(try_path(&mut unit, bad), Err(INVALID_PATH), "{bad}");
+        assert_eq!(try_path(&unit, bad), Err(INVALID_PATH), "{bad}");
     }
-    assert_eq!(try_path(&mut unit, "/outside-tagfs.txt"), Err(PATH_TAKEN));
-    assert_eq!(try_path(&mut unit, "/file/below"), Err(PATH_TAKEN));
+    assert_eq!(try_path(&unit, "/outside-tagfs.txt"), Err(PATH_TAKEN));
+    assert_eq!(try_path(&unit, "/file/below"), Err(PATH_TAKEN));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(std::env::temp_dir(), root.join("link")).unwrap();
-        assert_eq!(try_path(&mut unit, "/link/x"), Err(INVALID_PATH));
+        assert_eq!(try_path(&unit, "/link/x"), Err(INVALID_PATH));
     }
     // 一个实体两个路径，两个实体同一路径。
     assert_eq!(
-        unit.apply(&[Change::Create { id: eid(52), tags: vec![p("/m"), p("/n")], content: vec![] }]),
+        unit.apply(&[Change::Create { id: eid(52), tags: vec![p("/m"), p("/n")], content: None }]),
         Err(INVALID_PATH)
     );
     assert_eq!(
         unit.apply(&[
-            Change::Create { id: eid(53), tags: vec![p("/same")], content: vec![] },
-            Change::Create { id: eid(54), tags: vec![p("/same")], content: vec![] },
+            Change::Create { id: eid(53), tags: vec![p("/same")], content: None },
+            Change::Create { id: eid(54), tags: vec![p("/same")], content: None },
         ]),
         Err(PATH_TAKEN)
     );
-    // 删掉之后再写，和别的单元一样报“不存在”。
-    let file = by_path(&unit, "/file").unwrap();
-    assert_eq!(
-        unit.apply(&[Change::Delete { id: file }, Change::Write { id: file, offset: 0, data: b"z".to_vec() }]),
-        Err(UnitError::NotFound(file))
-    );
     assert_eq!(unit.snapshot().all().unwrap(), before);
     assert!(!root.join("same").exists());
-    assert!(root.join("file").exists());
+    assert_eq!(staged_files(&root), 0);
+    // 删掉之后再写，和别的单元一样报“不存在”。
+    let file = by_path(&unit, "/file").unwrap();
+    unit.apply(&[Change::Delete { id: file }]).unwrap();
+    assert!(!root.join("file").exists());
+    assert_eq!(unit.write(&file, 0, b"z"), Err(UnitError::NotFound(file)));
 }
 
 #[test]
@@ -302,10 +316,14 @@ fn reopening_catches_up_with_changes_made_on_the_host() {
     fs::write(root.join("keep"), b"k").unwrap();
     fs::write(root.join("gone"), b"g").unwrap();
     fs::write(root.join("old-name"), b"r").unwrap();
-    let (mut unit, _) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
-    unit.apply(&[Change::Create { id: eid(9), tags: vec![], content: b"image only".to_vec() }]).unwrap();
+    let (unit, _) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
+    create(&unit, eid(9), vec![], b"image only");
+    // 一份没用上的暂存：重新挂载时连同宿主上的暂存文件一起回收。
+    let leftover = unit.stage().unwrap();
+    unit.write_staged(leftover, 0, b"never used").unwrap();
     let keep = by_path(&unit, "/keep").unwrap();
     let renamed = by_path(&unit, "/old-name").unwrap();
+    unit.sync().unwrap();
     drop(unit);
 
     fs::remove_file(root.join("gone")).unwrap();
@@ -318,6 +336,8 @@ fn reopening_catches_up_with_changes_made_on_the_host() {
     assert_eq!(content(&unit, &eid(9)), b"image only");
     assert_eq!(by_path(&unit, "/new-name"), Some(renamed), "same entity after a rename on the host");
     assert_eq!(report, ScanReport { added: 1, removed: 1, renamed: 1, skipped: 0 });
+    assert_eq!(staged_files(&root), 0);
+    assert_eq!(unit.write_staged(leftover, 0, b"x"), Err(UnitError::UnknownStage(leftover)));
 }
 
 #[test]
@@ -340,37 +360,34 @@ fn identities_follow_gits_rules() {
 #[test]
 fn an_interrupted_change_is_finished_when_reopened() {
     for stage in 0..3 {
-        let (root, mut unit) = fresh(&format!("recover-{stage}"));
-        unit.apply(&[
-            Change::Create { id: eid(1), tags: vec![p("/a")], content: b"A".to_vec() },
-            Change::Create { id: eid(2), tags: vec![p("/b")], content: b"B".to_vec() },
-        ])
-        .unwrap();
+        let (root, unit) = fresh(&format!("recover-{stage}"));
+        let first = [new_entity(&unit, eid(1), vec![p("/a")], b"A"), new_entity(&unit, eid(2), vec![p("/b")], b"B")];
+        unit.apply(&first).unwrap();
+        unit.write(&eid(1), 1, b"1").unwrap();
         let changes = [
-            Change::Write { id: eid(1), offset: 1, data: b"1".to_vec() },
             Change::RemoveTag { id: eid(1), tag: p("/a") },
             Change::RemoveTag { id: eid(2), tag: p("/b") },
             Change::AddTag { id: eid(1), tag: p("/b") },
             Change::AddTag { id: eid(2), tag: p("/x/a") },
-            Change::Create { id: eid(3), tags: vec![p("/c")], content: b"C".to_vec() },
+            new_entity(&unit, eid(3), vec![p("/c")], b"C"),
             Change::Copy { from: eid(2), id: eid(4), tags: vec![p("/d")] },
         ];
         // 照 run 的第 1 步做，再按阶段做一部分宿主操作，然后“断电”。
         {
-            let inner = unit.inner.get_mut();
-            let plan = inner.plan(&changes).unwrap();
-            assert!(plan.hydrate.is_empty());
+            let plan = unit.plan(&changes).unwrap();
+            assert!(plan.hydrate.is_empty() && plan.copy_in.is_empty() && plan.stage_in.is_empty());
             let aux = [Aux::Put(AUX_INTENT.to_vec(), plan.intent.encode())];
-            inner.image.commit_batch(&mut Batch { changes: &plan.changes, aux: &aux, ..Batch::default() }).unwrap();
+            unit.image.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
             if stage >= 1 {
-                inner.carry_out(&plan.intent).unwrap();
+                unit.carry_out(&plan.intent).unwrap();
             }
             if stage >= 2 {
                 // 第 2 步做完以后再重做一遍，结果也一样。
-                fs::create_dir_all(inner.tmp()).unwrap();
-                inner.carry_out(&plan.intent).unwrap();
+                fs::create_dir_all(unit.tmp()).unwrap();
+                unit.carry_out(&plan.intent).unwrap();
             }
         }
+        unit.sync().unwrap();
         drop(unit);
 
         let (unit, report) = DirUnit::open(&root, ids()).unwrap();
@@ -383,6 +400,7 @@ fn an_interrupted_change_is_finished_when_reopened() {
         assert_eq!(image_size(&unit, &eid(3)), 0);
         assert!(unit.image().aux_get(AUX_INTENT).unwrap().is_none());
         assert!(!root.join(".tagfs/tmp").exists());
+        assert_eq!(staged_files(&root), 0);
         unit.image().verify().unwrap();
     }
 }
@@ -400,12 +418,14 @@ fn works_inside_a_volume() {
         .writer("user", |_| true)
         .modify(|_, _| true)
         .create(|_| Some(vec![]));
-    let mut v = Volume::new(rules, ids());
-    v.attach(Box::new(MemUnit::new(UnitId([2; 16])))).unwrap();
-    v.attach(Box::new(dir)).unwrap();
+    let v = Volume::new(rules, ids());
+    v.attach(Arc::new(MemUnit::new(UnitId([2; 16])))).unwrap();
+    v.attach(Arc::new(dir)).unwrap();
 
+    let stage = v.stage(Some(UnitId([2; 16]))).unwrap();
+    stage.write(0, b"from memory").unwrap();
     let mut tx = v.begin(&());
-    let a = tx.create(Some(UnitId([2; 16])), vec![Tag::new("user", "n", "a")], b"from memory".to_vec()).unwrap();
+    let a = tx.create_from(stage, vec![Tag::new("user", "n", "a")]).unwrap();
     tx.commit().unwrap();
     // 跨单元复制到目录单元里的一个路径上（两阶段提交）。
     let mut tx = v.begin(&());
@@ -414,12 +434,14 @@ fn works_inside_a_volume() {
     tx.commit().unwrap();
     assert_eq!(fs::read(root.join("exports/a.txt")).unwrap(), b"from memory");
     assert_eq!(v.query(&(), &Query::has("tagfs", "txn_pending")).unwrap(), vec![]);
+    assert_eq!(staged_files(&root), 0);
 
-    // 经卷改路径。
+    // 经卷写内容、改路径。
+    v.write(&(), &b, 0, b"FROM").unwrap();
     let mut tx = v.begin(&());
     tx.remove_tag(&b, p("/exports/a.txt")).unwrap();
     tx.add_tag(&b, p("/renamed.txt")).unwrap();
     tx.commit().unwrap();
-    assert!(root.join("renamed.txt").is_file());
+    assert_eq!(fs::read(root.join("renamed.txt")).unwrap(), b"FROM memory");
     assert_eq!(v.query(&(), &Query::is("tagfs", "hostfs_path", "/renamed.txt")).unwrap(), vec![b]);
 }

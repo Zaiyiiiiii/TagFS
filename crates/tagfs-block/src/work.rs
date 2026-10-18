@@ -1,98 +1,104 @@
-//! 一次提交的工作区：在已提交的树上做改动，分配和释放块。
+//! 在写者状态上做一次改动：改树，分配和释放块。
 //!
-//! 工作区出错就整个丢弃，单元的状态不变；写下去的数据块和节点都在空闲空间里，没有被任何根引用。
+//! 一次改动出错时，调用者把写者状态恢复成改动前的样子（见 `BlockUnit::update`）；改动中写下的块
+//! 都在空闲空间里，没有被任何版本引用。
 
-use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
-use tagfs_core::{Change, EntityId, Tag, TxnId, TxnInfo, UnitError};
+use tagfs_core::{Change, EntityId, StageId, Tag, TxnId, TxnInfo, UnitError};
 use tagfs_device::BlockDevice;
 
+use crate::State;
 use crate::codec::put_u64;
 use crate::extent::ExtentSet;
 use crate::keys;
-use crate::tree::Tree;
-use crate::view::{INLINE_MAX, Object, View, encode_prepared};
+use crate::view::{Extent, INLINE_MAX, Object, View, encode_prepared};
 
-/// 一次复制对象内容时最多搬多少块。
-const COPY_CHUNK_BLOCKS: u64 = 64;
 /// 准备记录切成这么大的片存进树里，每片一个条目。
 const PREPARED_CHUNK: usize = 1024;
-/// 从 [`crate::Source`] 一次读这么多。
-const FILL_CHUNK: usize = 1 << 20;
 
-pub(crate) struct Work<D: BlockDevice> {
-    pub(crate) dev: Rc<RefCell<D>>,
+pub(crate) struct Work<'a, D: BlockDevice> {
+    pub(crate) dev: &'a D,
     pub(crate) bs: u64,
-    pub(crate) tree: Tree,
-    /// 可以分配的块。
-    pub(crate) free: ExtentSet,
-    /// 本次提交新分配的块。再释放时直接回到 `free`。
-    pub(crate) fresh: ExtentSet,
-    /// 本次提交释放的、已提交状态还在用的块。提交之后才能再分配。
-    pub(crate) released: ExtentSet,
-    pub(crate) next_object: u64,
+    pub(crate) s: &'a mut State,
+    /// 本次释放的、最近一次提交还在用的块：下一次提交之后才能再分配。
+    pub(crate) durable: ExtentSet,
+    /// 本次释放的、最近一次提交之后才分配的块：没有读者在读就能再分配。
+    pub(crate) young: ExtentSet,
 }
 
-impl<D: BlockDevice> Work<D> {
+/// 一次大块写入的安排：在锁外把数据写进新分配的块，再回到锁里登记。
+pub(crate) struct WritePlan {
+    pub(crate) object: u64,
+    /// 涉及的逻辑块 `[b0, b1)`。
+    pub(crate) b0: u64,
+    pub(crate) b1: u64,
+    /// 首、尾两块如果只写一部分，原来的内容在哪个物理块（没有映射为 `None`，读出来是零）。
+    pub(crate) head: Option<u64>,
+    pub(crate) tail: Option<u64>,
+    /// 新分配的块：起始、块数，按逻辑顺序覆盖 `[b0, b1)`。
+    pub(crate) blocks: Vec<(u64, u64)>,
+    /// 写完之后的长度。
+    pub(crate) size: u64,
+}
+
+impl<D: BlockDevice> Work<'_, D> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, UnitError> {
-        self.tree.get(&*self.dev.borrow(), key)
+        self.s.tree.get(self.dev, key)
     }
 
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), UnitError> {
-        self.tree.insert(&*self.dev.borrow(), key, value)
+        self.s.tree.insert(self.dev, key, value)
     }
 
     fn del(&mut self, key: &[u8]) -> Result<bool, UnitError> {
-        self.tree.remove(&*self.dev.borrow(), key)
+        self.s.tree.remove(self.dev, key)
     }
 
     fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, UnitError> {
         let mut out = Vec::new();
-        self.tree.scan_prefix(&*self.dev.borrow(), prefix, &mut |k, _| {
+        self.s.tree.scan_prefix(self.dev, prefix, &mut |k, _| {
             out.push(k.to_vec());
             Ok(true)
         })?;
         Ok(out)
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let dev = self.dev.borrow();
-        f(&View { tree: &self.tree, dev: &*dev, bs: self.bs })
+    pub(crate) fn with_view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
+        f(&View { tree: &self.s.tree, dev: self.dev, bs: self.bs })
     }
 
     /// 分配 `n` 个块，尽量连续。
-    fn alloc(&mut self, mut n: u64) -> Result<Vec<(u64, u64)>, UnitError> {
+    pub(crate) fn alloc(&mut self, mut n: u64) -> Result<Vec<(u64, u64)>, UnitError> {
         let mut out = Vec::new();
         while n > 0 {
-            let (s, l) = self.free.take(n).ok_or(UnitError::NoSpace)?;
-            self.fresh.insert(s, l);
+            let (s, l) = self.s.free.take(n).ok_or(UnitError::NoSpace)?;
+            self.s.fresh.insert(s, l);
             out.push((s, l));
             n -= l;
         }
         Ok(out)
     }
 
-    /// 释放一段块：本次新分配的直接回到空闲，已提交在用的等提交后。
+    /// 释放一段块。
     pub(crate) fn release(&mut self, start: u64, len: u64) {
         let mut cursor = start;
-        for (s, l) in self.fresh.remove_overlap(start, len) {
-            self.released.insert(cursor, s - cursor);
-            self.free.insert(s, l);
+        for (s, l) in self.s.fresh.remove_overlap(start, len) {
+            self.durable.insert(cursor, s - cursor);
+            self.young.insert(s, l);
             cursor = s + l;
         }
-        self.released.insert(cursor, start + len - cursor);
+        self.durable.insert(cursor, start + len - cursor);
     }
 
-    fn write_blocks(&mut self, block: u64, data: &[u8]) -> Result<(), UnitError> {
-        self.dev.borrow_mut().write_at(block * self.bs, data).map_err(|_| UnitError::Device)
+    fn write_blocks(&self, block: u64, data: &[u8]) -> Result<(), UnitError> {
+        self.dev.write_at(block * self.bs, data).map_err(|_| UnitError::Device)
     }
 
     // ---- 对象 ----
 
-    fn object(&self, o: u64) -> Result<Object, UnitError> {
+    pub(crate) fn object(&self, o: u64) -> Result<Object, UnitError> {
         self.with_view(|v| v.object(o))
     }
 
@@ -107,16 +113,19 @@ impl<D: BlockDevice> Work<D> {
         self.put(keys::extent(o, logical), v)
     }
 
-    fn new_object(&mut self, content: &[u8]) -> Result<u64, UnitError> {
-        let o = self.next_object;
-        self.next_object += 1;
-        if content.len() <= INLINE_MAX {
-            self.put_object(o, &Object { refs: 1, size: content.len() as u64, inline: Some(content.to_vec()) })?;
-        } else {
-            self.put_object(o, &Object { refs: 1, size: 0, inline: None })?;
-            self.write_object(o, 0, content)?;
-        }
+    /// 新的空对象，引用数为 `refs`。
+    fn new_object(&mut self, refs: u64) -> Result<u64, UnitError> {
+        let o = self.s.next_object;
+        self.s.next_object += 1;
+        self.put_object(o, &Object { refs, size: 0, inline: Some(Vec::new()) })?;
         Ok(o)
+    }
+
+    /// 回收对象和它的块。
+    fn free_object(&mut self, o: u64) -> Result<(), UnitError> {
+        self.unmap(o, 0, u64::MAX)?;
+        self.del(&keys::object(o))?;
+        Ok(())
     }
 
     /// 引用数减一，减到零就回收对象和它的块。
@@ -126,9 +135,7 @@ impl<D: BlockDevice> Work<D> {
         if rec.refs > 0 {
             return self.put_object(o, &rec);
         }
-        self.unmap(o, 0, u64::MAX)?;
-        self.del(&keys::object(o))?;
-        Ok(())
+        self.free_object(o)
     }
 
     /// 去掉逻辑块 `[b0, b1)` 的映射并释放对应的物理块；跨边界的区段只去掉重叠的部分。
@@ -153,54 +160,73 @@ impl<D: BlockDevice> Work<D> {
         self.with_view(|v| v.read_object(o, logical * self.bs, out)).map(|_| ())
     }
 
-    /// 写对象内容。对象改由区段存放时，新内容写进新分配的块，原来的块释放：已提交的状态不受影响。
-    fn write_object(&mut self, o: u64, offset: u64, data: &[u8]) -> Result<(), UnitError> {
+    /// 内联的内容放不下了：改由区段存放，原来的内容写成第一块。
+    fn uninline(&mut self, o: u64) -> Result<(), UnitError> {
         let mut rec = self.object(o)?;
-        let end = offset.checked_add(data.len() as u64).ok_or(UnitError::NoSpace)?;
-        let new_size = rec.size.max(end);
-        if let Some(inline) = &mut rec.inline {
-            if new_size as usize <= INLINE_MAX {
-                inline.resize(new_size as usize, 0);
-                inline[offset as usize..end as usize].copy_from_slice(data);
-                rec.size = new_size;
-                return self.put_object(o, &rec);
-            }
-            // 放不下了，改成区段：先把原来的内容写成第一段。
-            let old = core::mem::take(inline);
-            self.put_object(o, &Object { refs: rec.refs, size: 0, inline: None })?;
-            if !old.is_empty() {
-                self.write_object(o, 0, &old)?;
-            }
-            return self.write_object(o, offset, data);
+        let Some(old) = rec.inline.take() else { return Ok(()) };
+        if !old.is_empty() {
+            let (s, _) = self.alloc(1)?[0];
+            let mut block = vec![0u8; self.bs as usize];
+            block[..old.len()].copy_from_slice(&old);
+            self.write_blocks(s, &block)?;
+            self.put_extent(o, 0, s, 1)?;
         }
-        if !data.is_empty() {
-            let bs = self.bs;
-            let (b0, b1) = (offset / bs, end.div_ceil(bs));
-            let mut buf = vec![0u8; ((b1 - b0) * bs) as usize];
-            let head_partial = !offset.is_multiple_of(bs);
-            if head_partial {
-                self.read_block(o, b0, &mut buf[..bs as usize])?;
-            }
-            if !end.is_multiple_of(bs) && (b1 - 1 > b0 || !head_partial) {
-                let at = ((b1 - 1 - b0) * bs) as usize;
-                self.read_block(o, b1 - 1, &mut buf[at..at + bs as usize])?;
-            }
-            let at = (offset - b0 * bs) as usize;
-            buf[at..at + data.len()].copy_from_slice(data);
-            self.unmap(o, b0, b1)?;
-            let mut logical = b0;
-            for (s, l) in self.alloc(b1 - b0)? {
-                let from = ((logical - b0) * bs) as usize;
-                self.write_blocks(s, &buf[from..from + (l * bs) as usize])?;
-                self.put_extent(o, logical, s, l)?;
-                logical += l;
-            }
-        }
-        rec.size = new_size;
         self.put_object(o, &rec)
     }
 
-    fn truncate_object(&mut self, o: u64, len: u64) -> Result<(), UnitError> {
+    /// 写对象内容。内联放得下就直接改内联的内容，否则返回大块写入的安排（[`Work::finish_write`] 登记）。
+    pub(crate) fn plan_write(&mut self, o: u64, offset: u64, data: &[u8]) -> Result<Option<WritePlan>, UnitError> {
+        let mut rec = self.object(o)?;
+        let end = offset.checked_add(data.len() as u64).ok_or(UnitError::NoSpace)?;
+        let size = rec.size.max(end);
+        if let Some(inline) = &mut rec.inline
+            && size as usize <= INLINE_MAX
+        {
+            inline.resize(size as usize, 0);
+            inline[offset as usize..end as usize].copy_from_slice(data);
+            rec.size = size;
+            self.put_object(o, &rec)?;
+            return Ok(None);
+        }
+        self.uninline(o)?;
+        if data.is_empty() {
+            // 只是变长：多出来的部分是空洞。
+            let mut rec = self.object(o)?;
+            rec.size = size;
+            self.put_object(o, &rec)?;
+            return Ok(None);
+        }
+        let bs = self.bs;
+        let (b0, b1) = (offset / bs, end.div_ceil(bs));
+        let phys = |w: &Self, b: u64| -> Result<Option<u64>, UnitError> {
+            let hit = w.with_view(|v| v.extents_in(o, b, b + 1))?;
+            Ok(hit.first().map(|&(l, p, _)| p + (b - l)))
+        };
+        let head = if offset.is_multiple_of(bs) { None } else { phys(self, b0)? };
+        let tail = if end.is_multiple_of(bs) { None } else { phys(self, b1 - 1)? };
+        let blocks = self.alloc(b1 - b0)?;
+        for &(s, l) in &blocks {
+            self.s.inflight.insert(s, l);
+        }
+        Ok(Some(WritePlan { object: o, b0, b1, head, tail, blocks, size }))
+    }
+
+    /// 在锁外写好的块登记成对象的内容，原来的块释放。
+    pub(crate) fn finish_write(&mut self, plan: &WritePlan) -> Result<(), UnitError> {
+        let o = plan.object;
+        self.unmap(o, plan.b0, plan.b1)?;
+        let mut logical = plan.b0;
+        for &(s, l) in &plan.blocks {
+            self.s.inflight.remove_overlap(s, l);
+            self.put_extent(o, logical, s, l)?;
+            logical += l;
+        }
+        let mut rec = self.object(o)?;
+        rec.size = plan.size;
+        self.put_object(o, &rec)
+    }
+
+    pub(crate) fn truncate_object(&mut self, o: u64, len: u64) -> Result<(), UnitError> {
         let mut rec = self.object(o)?;
         if let Some(inline) = &mut rec.inline {
             if len as usize <= INLINE_MAX {
@@ -209,9 +235,7 @@ impl<D: BlockDevice> Work<D> {
                 return self.put_object(o, &rec);
             }
             // 变长到放不下：转成区段，多出来的部分是空洞。
-            let old = core::mem::take(inline);
-            self.put_object(o, &Object { refs: rec.refs, size: 0, inline: None })?;
-            self.write_object(o, 0, &old)?;
+            self.uninline(o)?;
             let mut rec = self.object(o)?;
             rec.size = len;
             return self.put_object(o, &rec);
@@ -244,36 +268,89 @@ impl<D: BlockDevice> Work<D> {
         self.put_object(o, &rec)
     }
 
-    /// 复制一份对象，引用数为一。
-    fn duplicate(&mut self, o: u64) -> Result<u64, UnitError> {
-        let rec = self.object(o)?;
-        let copy = self.next_object;
-        self.next_object += 1;
-        self.put_object(copy, &Object { refs: 1, size: rec.size, inline: rec.inline.clone() })?;
-        if rec.inline.is_none() {
-            let bs = self.bs;
-            for (l, p, n) in self.with_view(|v| v.extents_in(o, 0, u64::MAX))? {
-                let mut done = 0;
-                while done < n {
-                    let chunk = (n - done).min(COPY_CHUNK_BLOCKS);
-                    let mut buf = vec![0u8; (chunk * bs) as usize];
-                    self.dev.borrow().read_at((p + done) * bs, &mut buf).map_err(|_| UnitError::Device)?;
-                    let mut at = 0;
-                    for (s, len) in self.alloc(chunk)? {
-                        self.write_blocks(s, &buf[(at * bs) as usize..((at + len) * bs) as usize])?;
-                        self.put_extent(copy, l + done + at, s, len)?;
-                        at += len;
-                    }
-                    done += chunk;
-                }
-            }
+    /// 对象的全部区段（复制用）。
+    pub(crate) fn extents(&self, o: u64) -> Result<Vec<Extent>, UnitError> {
+        self.with_view(|v| v.extents_in(o, 0, u64::MAX))
+    }
+
+    /// 实体改用一份新对象：内容是在锁外复制好的区段（逻辑块、物理块、块数），原来的对象引用数减一。
+    /// 返回新对象。
+    pub(crate) fn switch_to_copy(
+        &mut self,
+        id: &EntityId,
+        from: u64,
+        size: u64,
+        layout: &[Extent],
+    ) -> Result<u64, UnitError> {
+        let copy = self.new_object(1)?;
+        self.put_object(copy, &Object { refs: 1, size, inline: None })?;
+        for &(logical, phys, n) in layout {
+            self.s.inflight.remove_overlap(phys, n);
+            self.put_extent(copy, logical, phys, n)?;
         }
+        self.unref(from)?;
+        self.set_entity_object(id, copy)?;
         Ok(copy)
+    }
+
+    /// 实体要改内容，对象被共享着：内联的对象当场复制一份给它（很小）。返回它独占的对象；
+    /// 对象用区段存放时返回 `Err(对象)`，由调用者在锁外复制。
+    pub(crate) fn own_small(&mut self, id: &EntityId) -> Result<Result<u64, u64>, UnitError> {
+        let o = self.entity_object(id)?;
+        let rec = self.object(o)?;
+        if rec.refs == 1 {
+            return Ok(Ok(o));
+        }
+        if rec.inline.is_none() {
+            return Ok(Err(o));
+        }
+        let copy = self.new_object(1)?;
+        self.put_object(copy, &Object { refs: 1, ..rec })?;
+        self.unref(o)?;
+        self.set_entity_object(id, copy)?;
+        Ok(Ok(copy))
+    }
+
+    // ---- 暂存 ----
+
+    pub(crate) fn new_stage(&mut self) -> Result<StageId, UnitError> {
+        let o = self.new_object(0)?;
+        self.put(keys::staged(o), Vec::new())?;
+        Ok(StageId(o))
+    }
+
+    /// 暂存对应的对象；不存在时报错。
+    pub(crate) fn staged_object(&self, stage: StageId) -> Result<u64, UnitError> {
+        self.with_view(|v| v.staged(stage))
+    }
+
+    pub(crate) fn discard_stage(&mut self, stage: StageId) -> Result<(), UnitError> {
+        let o = self.staged_object(stage)?;
+        self.del(&keys::staged(o))?;
+        self.free_object(o)
+    }
+
+    /// 用掉暂存：对象归一个实体，引用数为一。
+    fn take_stage(&mut self, stage: StageId) -> Result<u64, UnitError> {
+        let o = self.staged_object(stage)?;
+        self.del(&keys::staged(o))?;
+        let mut rec = self.object(o)?;
+        rec.refs = 1;
+        self.put_object(o, &rec)?;
+        Ok(o)
+    }
+
+    /// 实体的内容换成暂存的内容，原来的对象引用数减一。
+    pub(crate) fn adopt(&mut self, id: &EntityId, stage: StageId) -> Result<(), UnitError> {
+        let old = self.entity_object(id)?;
+        let o = self.take_stage(stage)?;
+        self.unref(old)?;
+        self.set_entity_object(id, o)
     }
 
     // ---- 实体 ----
 
-    fn entity_object(&self, id: &EntityId) -> Result<u64, UnitError> {
+    pub(crate) fn entity_object(&self, id: &EntityId) -> Result<u64, UnitError> {
         self.with_view(|v| v.entity_object(id))?.ok_or(UnitError::NotFound(*id))
     }
 
@@ -295,42 +372,11 @@ impl<D: BlockDevice> Work<D> {
     }
 
     fn insert_entity(&mut self, id: &EntityId, o: u64, tags: &[Tag]) -> Result<(), UnitError> {
-        if self.get(&keys::entity(id))?.is_some() {
-            return Err(UnitError::Exists(*id));
-        }
         self.set_entity_object(id, o)?;
         for t in tags {
             self.add_tag(id, t)?;
         }
         Ok(())
-    }
-
-    /// 实体要改内容：对象被共享时先复制一份给它。
-    fn own_object(&mut self, id: &EntityId) -> Result<u64, UnitError> {
-        let o = self.entity_object(id)?;
-        if self.object(o)?.refs == 1 {
-            return Ok(o);
-        }
-        let copy = self.duplicate(o)?;
-        self.unref(o)?;
-        self.set_entity_object(id, copy)?;
-        Ok(copy)
-    }
-
-    /// 用 `source` 的内容替换实体的内容，分段读写。
-    pub(crate) fn fill(&mut self, id: &EntityId, source: &mut dyn crate::Source) -> Result<(), UnitError> {
-        let o = self.own_object(id)?;
-        self.truncate_object(o, 0)?;
-        let mut buf = vec![0u8; FILL_CHUNK];
-        let mut offset = 0u64;
-        loop {
-            let n = source.read(offset, &mut buf)?;
-            if n == 0 {
-                return Ok(());
-            }
-            self.write_object(o, offset, &buf[..n])?;
-            offset += n as u64;
-        }
     }
 
     pub(crate) fn apply(&mut self, change: &Change) -> Result<(), UnitError> {
@@ -339,7 +385,10 @@ impl<D: BlockDevice> Work<D> {
                 if self.get(&keys::entity(id))?.is_some() {
                     return Err(UnitError::Exists(*id));
                 }
-                let o = self.new_object(content)?;
+                let o = match content {
+                    Some(stage) => self.take_stage(*stage)?,
+                    None => self.new_object(1)?,
+                };
                 self.insert_entity(id, o, tags)
             }
             Change::Copy { from, id, tags } => {
@@ -368,20 +417,18 @@ impl<D: BlockDevice> Work<D> {
                 self.entity_object(id)?;
                 self.remove_tag(id, tag)
             }
-            Change::Write { id, offset, data } => {
-                let o = self.own_object(id)?;
-                self.write_object(o, *offset, data)
-            }
-            Change::Truncate { id, len } => {
-                let o = self.own_object(id)?;
-                self.truncate_object(o, *len)
-            }
         }
     }
 
     // ---- 事务记录 ----
 
+    /// 记下准备记录。其中引用的暂存必须存在：它们从此归这条记录。
     pub(crate) fn put_prepared(&mut self, info: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
+        for c in changes {
+            if let Change::Create { content: Some(stage), .. } = c {
+                self.staged_object(*stage)?;
+            }
+        }
         self.remove_prepared(&info.id)?;
         let payload = encode_prepared(info, changes);
         for (i, part) in payload.chunks(PREPARED_CHUNK).enumerate() {

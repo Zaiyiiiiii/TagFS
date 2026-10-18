@@ -1,5 +1,7 @@
 //! 卷的行为，用内存后端做存储单元。
 
+use std::sync::Arc;
+
 use tagfs_backend_mem::MemUnit;
 use tagfs_core::*;
 
@@ -62,9 +64,9 @@ fn uid(n: u8) -> UnitId {
 }
 
 fn volume(units: &[u8]) -> Volume<Rules<Ctx>> {
-    let mut v = Volume::new(rules(), Box::new(Counter(0)));
+    let v = Volume::new(rules(), Box::new(Counter(0)));
     for n in units {
-        v.attach(Box::new(MemUnit::new(uid(*n)))).unwrap();
+        v.attach(Arc::new(MemUnit::new(uid(*n)))).unwrap();
     }
     v
 }
@@ -73,9 +75,17 @@ fn name(n: &str) -> Tag {
     Tag::new("user", "name", n)
 }
 
+/// 新建实体。有内容时先写进暂存，随实体一起出现。
 fn create(v: &mut Volume<Rules<Ctx>>, ctx: &Ctx, unit: Option<u8>, tags: Vec<Tag>, content: &[u8]) -> EntityId {
     let mut tx = v.begin(ctx);
-    let id = tx.create(unit.map(uid), tags, content.to_vec()).unwrap();
+    let id = if content.is_empty() {
+        tx.create(unit.map(uid), tags)
+    } else {
+        let stage = v.stage(unit.map(uid)).unwrap();
+        stage.write(0, content).unwrap();
+        tx.create_from(stage, tags)
+    };
+    let id = id.unwrap();
     tx.commit().unwrap();
     id
 }
@@ -137,7 +147,7 @@ fn namespace_write_rules_default_to_deny() {
     assert_eq!(tx.add_tag(&a, Tag::new("system", "owner_app", "x")), Err(Error::NotWritable));
     assert_eq!(tx.add_tag(&a, Tag::new("other", "k", "v")), Err(Error::NotWritable));
     assert_eq!(tx.add_tag(&a, Tag::new("tagfs", "txn_pending", "x")), Err(Error::NotWritable));
-    assert_eq!(tx.create(None, vec![Tag::flag("tagfs", "anything")], vec![]), Err(Error::NotWritable));
+    assert_eq!(tx.create(None, vec![Tag::flag("tagfs", "anything")]), Err(Error::NotWritable));
     assert!(tx.add_tag(&a, name("fine")).is_ok());
     assert_eq!(tx.add_tag(&a, name(&"x".repeat(4097))), Err(Error::TagTooLong));
     assert!(tx.add_tag(&a, name(&"x".repeat(4096))).is_ok());
@@ -184,8 +194,8 @@ fn queries_can_be_read_page_by_page() {
 #[test]
 fn keys_a_unit_maps_follow_the_modify_rule() {
     let mut v = Volume::new(rules(), Box::new(Counter(0)));
-    v.attach(Box::new(MemUnit::new(uid(1)).mapping(&["where"]))).unwrap();
-    v.attach(Box::new(MemUnit::new(uid(2)))).unwrap();
+    v.attach(Arc::new(MemUnit::new(uid(1)).mapping(&["where"]))).unwrap();
+    v.attach(Arc::new(MemUnit::new(uid(2)))).unwrap();
     let a = create(&mut v, &ALICE, Some(1), vec![], b"");
     let b = create(&mut v, &ALICE, Some(2), vec![], b"");
     let place = Tag::new("tagfs", "where", "/a.txt");
@@ -197,10 +207,10 @@ fn keys_a_unit_maps_follow_the_modify_rule() {
     drop(tx);
     let mut tx = v.begin(&ALICE);
     assert!(tx.add_tag(&a, place.clone()).is_ok());
-    assert!(tx.create(Some(uid(1)), vec![place.clone()], vec![]).is_ok());
+    assert!(tx.create(Some(uid(1)), vec![place.clone()]).is_ok());
     // 单元 2 不映射这个键：它和别的 tagfs 键一样，谁都不能写。
     assert_eq!(tx.add_tag(&b, place.clone()), Err(Error::NotWritable));
-    assert_eq!(tx.create(Some(uid(2)), vec![place], vec![]), Err(Error::NotWritable));
+    assert_eq!(tx.create(Some(uid(2)), vec![place]), Err(Error::NotWritable));
 }
 
 #[test]
@@ -212,9 +222,7 @@ fn copy_shares_content_until_written() {
     tx.commit().unwrap();
     assert_eq!(read_all(&v, &ALICE, &b), b"hello");
 
-    let mut tx = v.begin(&ALICE);
-    tx.write(&b, 0, b"J".to_vec()).unwrap();
-    tx.commit().unwrap();
+    v.write(&ALICE, &b, 0, b"J").unwrap();
     assert_eq!(read_all(&v, &ALICE, &a), b"hello");
     assert_eq!(read_all(&v, &ALICE, &b), b"Jello");
 
@@ -227,15 +235,18 @@ fn copy_shares_content_until_written() {
 
 #[test]
 fn deleting_entities_releases_objects() {
-    let mut unit = MemUnit::new(uid(1));
+    let unit = MemUnit::new(uid(1));
     let a = EntityId([1; 16]);
     let b = EntityId([2; 16]);
+    let stage = unit.stage().unwrap();
+    unit.write_staged(stage, 0, b"x").unwrap();
     unit.apply(&[
-        Change::Create { id: a, tags: vec![], content: b"x".to_vec() },
+        Change::Create { id: a, tags: vec![], content: Some(stage) },
         Change::Copy { from: a, id: b, tags: vec![] },
     ])
     .unwrap();
     assert_eq!(unit.object_count(), 1);
+    assert_eq!(unit.stage_count(), 0, "the stage became the object");
     unit.apply(&[Change::Delete { id: a }]).unwrap();
     assert_eq!(unit.object_count(), 1);
     unit.apply(&[Change::Delete { id: b }]).unwrap();
@@ -252,12 +263,16 @@ fn a_failed_change_leaves_the_unit_untouched() {
     tx.commit().unwrap();
     assert_eq!(v.get(&ALICE, &a), Err(Error::NotFound));
 
-    let mut unit = MemUnit::new(uid(2));
+    let unit = MemUnit::new(uid(2));
     let x = EntityId([1; 16]);
-    let err = unit
-        .apply(&[Change::Create { id: x, tags: vec![], content: vec![] }, Change::Delete { id: EntityId([2; 16]) }]);
+    let stage = unit.stage().unwrap();
+    let err = unit.apply(&[
+        Change::Create { id: x, tags: vec![], content: Some(stage) },
+        Change::Delete { id: EntityId([2; 16]) },
+    ]);
     assert!(err.is_err());
     assert!(unit.snapshot().get(&x).unwrap().is_none());
+    assert_eq!(unit.stage_count(), 1, "a failed change does not use up the stage");
 }
 
 #[test]
@@ -271,7 +286,7 @@ fn units_are_one_volume_and_leave_with_their_entities() {
     assert_eq!(v.get(&ALICE, &b), Err(Error::NotFound));
     assert_eq!(v.query(&ALICE, &Query::has("user", "name")).unwrap(), vec![a]);
     let mut tx = v.begin(&ALICE);
-    assert_eq!(tx.create(Some(uid(2)), vec![], vec![]), Err(Error::NoUnit));
+    assert_eq!(tx.create(Some(uid(2)), vec![]), Err(Error::NoUnit));
     drop(tx);
 
     v.attach(two).unwrap();
@@ -302,24 +317,23 @@ fn a_cross_unit_transaction_is_atomic() {
 /// 手工搭出“主单元已提交、参与单元还没完成就断电”的现场。
 /// 单元 1 是主单元，新建 x；单元 2 给已有实体 e 加 Tag、新建 y。
 fn half_done(primary_committed: bool) -> (MemUnit, MemUnit, EntityId, EntityId, EntityId, String) {
-    let mut one = MemUnit::new(uid(1));
-    let mut two = MemUnit::new(uid(2));
+    let one = MemUnit::new(uid(1));
+    let two = MemUnit::new(uid(2));
     let owner = Tag::new("system", "owner_user", "alice");
     let e = EntityId([0xe0; 16]);
-    two.apply(&[Change::Create { id: e, tags: vec![owner.clone(), name("e")], content: vec![] }]).unwrap();
+    two.apply(&[Change::Create { id: e, tags: vec![owner.clone(), name("e")], content: None }]).unwrap();
 
     let txn = TxnId([0x77; 16]);
     let pending = Tag::new("tagfs", "txn_pending", txn.to_string());
     let info = TxnInfo { id: txn, primary: uid(1), participants: vec![uid(1), uid(2)] };
     let x = EntityId([0x10; 16]);
     let y = EntityId([0x20; 16]);
-    one.prepare(&info, &[Change::Create { id: x, tags: vec![owner.clone(), pending.clone()], content: vec![] }])
-        .unwrap();
+    one.prepare(&info, &[Change::Create { id: x, tags: vec![owner.clone(), pending.clone()], content: None }]).unwrap();
     two.prepare(
         &info,
         &[
             Change::AddTag { id: e, tag: name("touched") },
-            Change::Create { id: y, tags: vec![owner, pending.clone()], content: vec![] },
+            Change::Create { id: y, tags: vec![owner, pending.clone()], content: None },
             Change::AddTag { id: e, tag: pending.clone() },
         ],
     )
@@ -334,8 +348,8 @@ fn half_done(primary_committed: bool) -> (MemUnit, MemUnit, EntityId, EntityId, 
 #[test]
 fn an_undecided_unit_stays_online_with_pending_tags() {
     let (one, two, e, x, y, txn) = half_done(true);
-    let mut v = Volume::new(rules(), Box::new(Counter(100)));
-    v.attach(Box::new(two)).unwrap();
+    let v = Volume::new(rules(), Box::new(Counter(100)));
+    v.attach(Arc::new(two)).unwrap();
 
     // 主单元不在：单元 2 照常在线，e 带上未完成标记且只读，y 还没出现。
     let got = v.get(&ALICE, &e).unwrap();
@@ -347,7 +361,7 @@ fn an_undecided_unit_stays_online_with_pending_tags() {
     drop(tx);
 
     // 主单元上线：事务已提交，补完，去掉标记。
-    v.attach(Box::new(one)).unwrap();
+    v.attach(Arc::new(one)).unwrap();
     assert!(v.get(&ALICE, &e).unwrap().tags.contains(&name("touched")));
     assert!(v.get(&ALICE, &x).is_ok());
     assert!(v.get(&ALICE, &y).is_ok());
@@ -360,11 +374,11 @@ fn an_undecided_unit_stays_online_with_pending_tags() {
 #[test]
 fn a_transaction_the_primary_never_committed_is_dropped() {
     let (one, two, e, x, y, _) = half_done(false);
-    let mut v = Volume::new(rules(), Box::new(Counter(100)));
-    v.attach(Box::new(two)).unwrap();
+    let v = Volume::new(rules(), Box::new(Counter(100)));
+    v.attach(Arc::new(two)).unwrap();
     assert_eq!(pending_tags(&v, &ALICE), 1);
 
-    v.attach(Box::new(one)).unwrap();
+    v.attach(Arc::new(one)).unwrap();
     assert!(!v.get(&ALICE, &e).unwrap().tags.contains(&name("touched")));
     assert_eq!(v.get(&ALICE, &x), Err(Error::NotFound));
     assert_eq!(v.get(&ALICE, &y), Err(Error::NotFound));
@@ -376,12 +390,62 @@ fn a_transaction_the_primary_never_committed_is_dropped() {
 #[test]
 fn committed_primary_keeps_its_record_until_every_participant_is_done() {
     let (one, two, _, x, _, _) = half_done(true);
-    let mut v = Volume::new(rules(), Box::new(Counter(100)));
-    v.attach(Box::new(one)).unwrap();
+    let v = Volume::new(rules(), Box::new(Counter(100)));
+    v.attach(Arc::new(one)).unwrap();
     // 单元 2 还没上线：x 已经可见，但带着标记；主单元留着记录。
     assert!(v.get(&ALICE, &x).unwrap().tags.iter().any(|t| t.ns.is_tagfs()));
     assert_eq!(v.unit(uid(1)).unwrap().committed().unwrap().len(), 1);
-    v.attach(Box::new(two)).unwrap();
+    v.attach(Arc::new(two)).unwrap();
     assert_eq!(pending_tags(&v, &ALICE), 0);
     assert!(v.unit(uid(1)).unwrap().committed().unwrap().is_empty());
+}
+
+fn stages_in(v: &Volume<Rules<Ctx>>, unit: u8) -> String {
+    let u = v.unit(uid(unit)).unwrap();
+    u.describe().into_iter().find(|(k, _)| *k == "stages").unwrap().1
+}
+
+#[test]
+fn staged_content_appears_with_the_entity_or_not_at_all() {
+    let mut v = volume(&[1, 2]);
+    let a = create(&mut v, &ALICE, Some(1), vec![name("a")], b"abc");
+    // 没提交：暂存随事务丢掉，实体没有出现。
+    let mut tx = v.begin(&ALICE);
+    let b = tx.copy(&a, Some(uid(2)), vec![name("b")]).unwrap();
+    assert_eq!(stages_in(&v, 2), "1");
+    tx.abort();
+    assert_eq!(stages_in(&v, 2), "0");
+    assert_eq!(v.get(&ALICE, &b), Err(Error::NotFound));
+    // 提交失败（其中一项修改的实体已经不在了）：同样什么都不留。
+    let mut tx = v.begin(&ALICE);
+    tx.copy(&a, Some(uid(2)), vec![name("c")]).unwrap();
+    tx.add_tag(&a, name("x")).unwrap();
+    let mut other = v.begin(&ALICE);
+    other.delete(&a).unwrap();
+    other.commit().unwrap();
+    assert!(tx.commit().is_err());
+    assert_eq!(stages_in(&v, 2), "0");
+    assert!(v.query(&ALICE, &Query::is("user", "name", "c")).unwrap().is_empty());
+}
+
+#[test]
+fn writes_to_different_entities_run_side_by_side() {
+    let mut v = volume(&[1]);
+    let ids: Vec<EntityId> = (0..4).map(|i| create(&mut v, &ALICE, None, vec![name(&i.to_string())], b"")).collect();
+    let (v, ids) = (&v, &ids);
+    std::thread::scope(|s| {
+        for (n, id) in ids.iter().enumerate() {
+            s.spawn(move || {
+                for i in 0..200u64 {
+                    v.write(&ALICE, id, i, &[n as u8]).unwrap();
+                    // 读别的实体不受影响。
+                    let other = &ids[(n + 1) % ids.len()];
+                    v.read(&ALICE, other, 0, &mut [0u8; 8]).unwrap();
+                }
+            });
+        }
+    });
+    for (n, id) in ids.iter().enumerate() {
+        assert_eq!(read_all(v, &ALICE, id), vec![n as u8; 200]);
+    }
 }

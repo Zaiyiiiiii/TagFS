@@ -7,7 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use tagfs_core::{Change, EntityId, Key, Namespace, Tag, TxnId, TxnInfo, UnitError, UnitId, Value};
+use tagfs_core::{Change, EntityId, Key, Namespace, StageId, Tag, TxnId, TxnInfo, UnitError, UnitId, Value};
 
 pub(crate) struct Reader<'a> {
     buf: &'a [u8],
@@ -58,12 +58,6 @@ impl<'a> Reader<'a> {
         Ok(self.take(16)?.try_into().unwrap())
     }
 
-    /// 带 u32 长度前缀的字节串。
-    pub(crate) fn bytes(&mut self) -> Result<&'a [u8], UnitError> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
     /// 转义编码的字节串（键里用）。
     fn escaped(&mut self) -> Result<Vec<u8>, UnitError> {
         let mut out = Vec::new();
@@ -107,11 +101,6 @@ pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
 
 pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
-}
-
-pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u32(out, b.len() as u32);
-    out.extend_from_slice(b);
 }
 
 /// 转义但不加结尾：前缀查询用它，结果是所有以该内容开头的编码的公共前缀。
@@ -203,7 +192,13 @@ pub(crate) fn put_change(out: &mut Vec<u8>, c: &Change) {
             out.push(1);
             out.extend_from_slice(&id.0);
             put_tags(out, tags);
-            put_bytes(out, content);
+            match content {
+                Some(stage) => {
+                    out.push(1);
+                    put_u64(out, stage.0);
+                }
+                None => out.push(0),
+            }
         }
         Change::Copy { from, id, tags } => {
             out.push(2);
@@ -225,17 +220,6 @@ pub(crate) fn put_change(out: &mut Vec<u8>, c: &Change) {
             out.extend_from_slice(&id.0);
             put_tag(out, tag);
         }
-        Change::Write { id, offset, data } => {
-            out.push(6);
-            out.extend_from_slice(&id.0);
-            put_u64(out, *offset);
-            put_bytes(out, data);
-        }
-        Change::Truncate { id, len } => {
-            out.push(7);
-            out.extend_from_slice(&id.0);
-            put_u64(out, *len);
-        }
     }
 }
 
@@ -243,13 +227,19 @@ pub(crate) fn change(r: &mut Reader<'_>) -> Result<Change, UnitError> {
     let kind = r.u8()?;
     let id = EntityId(r.id16()?);
     Ok(match kind {
-        1 => Change::Create { id, tags: tags(r)?, content: r.bytes()?.to_vec() },
+        1 => {
+            let tags = tags(r)?;
+            let content = match r.u8()? {
+                0 => None,
+                1 => Some(StageId(r.u64()?)),
+                _ => return Err(UnitError::Corrupt),
+            };
+            Change::Create { id, tags, content }
+        }
         2 => Change::Copy { from: id, id: EntityId(r.id16()?), tags: tags(r)? },
         3 => Change::Delete { id },
         4 => Change::AddTag { id, tag: r.tag()? },
         5 => Change::RemoveTag { id, tag: r.tag()? },
-        6 => Change::Write { id, offset: r.u64()?, data: r.bytes()?.to_vec() },
-        7 => Change::Truncate { id, len: r.u64()? },
         _ => return Err(UnitError::Corrupt),
     })
 }
@@ -295,13 +285,12 @@ mod tests {
     fn changes_round_trip() {
         let id = EntityId([1; 16]);
         let all = vec![
-            Change::Create { id, tags: vec![Tag::new("u", "n", "x")], content: vec![1, 2, 3] },
+            Change::Create { id, tags: vec![Tag::new("u", "n", "x")], content: Some(StageId(42)) },
+            Change::Create { id, tags: vec![], content: None },
             Change::Copy { from: id, id: EntityId([2; 16]), tags: vec![] },
             Change::Delete { id },
             Change::AddTag { id, tag: Tag::new("u", "n", 5u64) },
             Change::RemoveTag { id, tag: Tag::flag("u", "s") },
-            Change::Write { id, offset: 9, data: vec![0; 4] },
-            Change::Truncate { id, len: 3 },
         ];
         let mut buf = Vec::new();
         for c in &all {

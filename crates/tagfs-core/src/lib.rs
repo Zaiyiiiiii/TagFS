@@ -17,5 +17,5 @@ pub use id::{EntityId, IdSource, TxnId};
 pub use policy::{Policy, Rules};
 pub use query::{Probe, Query};
 pub use tag::{Key, Namespace, Tag, Value};
-pub use unit::{Change, EntityRecord, Snapshot, TxnInfo, Unit, UnitError, UnitId};
-pub use volume::{Entity, Error, Txn, Volume};
+pub use unit::{Change, EntityRecord, Snapshot, StageId, TxnInfo, Unit, UnitError, UnitId};
+pub use volume::{Entity, Error, Stage, Txn, Volume};

@@ -3,16 +3,24 @@
 //! 操作系统用它建卷、接入存储单元、在事务里读写实体和 Tag、查询：
 //!
 //! ```no_run
+//! use std::sync::Arc;
 //! use tagfs::{Query, Tag, Unrestricted, Volume};
 //!
 //! let unit = tagfs::image::create("/tmp/demo.img", tagfs::new_unit_id()).unwrap();
-//! let mut vol = Volume::new(Unrestricted, Box::new(tagfs::SystemIds));
-//! vol.attach(Box::new(unit)).unwrap();
+//! let vol = Volume::new(Unrestricted, Box::new(tagfs::SystemIds));
+//! vol.attach(Arc::new(unit)).unwrap();
 //!
+//! // 内容先写进暂存，随新实体一起出现。
+//! let stage = vol.stage(None).unwrap();
+//! stage.write(0, b"hello").unwrap();
 //! let mut tx = vol.begin(&());
-//! let id = tx.create(None, vec![Tag::new("user", "name", "hello.txt")], b"hello".to_vec()).unwrap();
+//! let id = tx.create_from(stage, vec![Tag::new("user", "name", "hello.txt")]).unwrap();
 //! tx.commit().unwrap();
 //! assert_eq!(vol.query(&(), &Query::is("user", "name", "hello.txt")).unwrap(), vec![id]);
+//!
+//! // 之后的读写直接对内容进行，不经过事务。
+//! vol.write(&(), &id, 5, b", world").unwrap();
+//! vol.flush(&(), &id).unwrap();
 //! ```
 //!
 //! 存储单元由各后端提供，逻辑层不知道有哪些后端：
@@ -36,7 +44,7 @@ pub use tagfs_backend_mem::MemUnit;
 pub use tagfs_block::{BlockUnit, OpenError};
 pub use tagfs_core::{
     Change, Entity, EntityId, EntityRecord, Error, IdSource, Key, Namespace, Policy, Probe, Query, Rules, Snapshot,
-    Tag, Txn, TxnId, TxnInfo, Unit, UnitError, UnitId, Value, Volume,
+    Stage, StageId, Tag, Txn, TxnId, TxnInfo, Unit, UnitError, UnitId, Value, Volume,
 };
 pub use tagfs_device::{BlockDevice, DeviceError, MemDevice};
 pub use tagfs_device_host::FileDevice;
@@ -200,8 +208,8 @@ mod tests {
     use super::*;
 
     fn volume_with(unit: Box<dyn Unit>) -> Volume<Unrestricted> {
-        let mut v = Volume::new(Unrestricted, Box::new(SystemIds));
-        v.attach(unit).unwrap();
+        let v = Volume::new(Unrestricted, Box::new(SystemIds));
+        v.attach(unit.into()).unwrap();
         v
     }
 
@@ -209,24 +217,27 @@ mod tests {
     fn an_image_unit_round_trips_through_reopening() {
         let path = std::env::temp_dir().join(format!("tagfs-facade-{}.img", std::process::id()));
         let unit = image::create(&path, new_unit_id()).unwrap();
-        let mut v = volume_with(Box::new(unit));
+        let v = volume_with(Box::new(unit));
+        let stage = v.stage(None).unwrap();
+        stage.write(0, &[5; 10_000]).unwrap();
         let mut tx = v.begin(&());
-        let id = tx.create(None, vec![Tag::new("user", "name", "a")], vec![5; 10_000]).unwrap();
+        let id = tx.create_from(stage, vec![Tag::new("user", "name", "a")]).unwrap();
         tx.commit().unwrap();
+        v.write(&(), &id, 10_000, &[6; 5_000]).unwrap();
+        v.flush(&(), &id).unwrap();
         drop(v);
 
         let v = volume_with(open_unit(&path).unwrap());
-        assert_eq!(v.get(&(), &id).unwrap().size, 10_000);
+        assert_eq!(v.get(&(), &id).unwrap().size, 15_000);
         assert_eq!(v.query(&(), &Query::has("user", "name")).unwrap(), vec![id]);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn a_cursor_walks_all_results() {
-        let mut v = volume_with(Box::new(MemUnit::new(new_unit_id())));
+        let v = volume_with(Box::new(MemUnit::new(new_unit_id())));
         let mut tx = v.begin(&());
-        let mut ids: Vec<_> =
-            (0..10u64).map(|i| tx.create(None, vec![Tag::new("u", "n", i)], vec![]).unwrap()).collect();
+        let mut ids: Vec<_> = (0..10u64).map(|i| tx.create(None, vec![Tag::new("u", "n", i)]).unwrap()).collect();
         tx.commit().unwrap();
         ids.sort();
         let mut c = Cursor::new(Query::has("u", "n"), 4);

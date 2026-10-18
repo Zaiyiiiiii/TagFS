@@ -6,7 +6,7 @@
 mod syntax;
 
 use std::fmt::Display;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use tagfs_core::{EntityId, Tag, UnitId};
@@ -184,20 +184,10 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "cat" => {
+            // 卷一段一段地发，收到一段写一段。
             let id = entity_id(arg(args, 1, "entity id")?)?;
             let out = std::io::stdout();
-            let mut out = out.lock();
-            let mut offset = 0u64;
-            loop {
-                let Response::Bytes(chunk) = vol.call(Request::Read { id, offset, len: 1 << 20 })? else {
-                    return Err("unexpected answer".into());
-                };
-                if chunk.is_empty() {
-                    break;
-                }
-                out.write_all(&chunk).map_err(io_out)?;
-                offset += chunk.len() as u64;
-            }
+            vol.0.read(id, 0, u64::MAX, &mut out.lock()).map_err(io_out)??;
         }
         "put" => {
             let source = arg(args, 1, "file")?;
@@ -207,13 +197,21 @@ fn run(args: &[String]) -> Result<(), String> {
                 unit = Some(unit_id(arg(rest, 1, "unit")?)?);
                 rest = &rest[2..];
             }
-            let mut content = Vec::new();
-            if source == "-" {
-                std::io::stdin().read_to_end(&mut content).map_err(err)?;
+            let tags = tags(rest)?;
+            // 内容边读边发，写进暂存；实体随事务出现，内容随它一起出现。
+            let Response::Staged(stage) = vol.call(Request::Stage { unit })? else {
+                return Err("unexpected answer".into());
+            };
+            let sent = if source == "-" {
+                vol.0.write_staged(stage, 0, &mut std::io::stdin().lock())
             } else {
-                content = std::fs::read(source).map_err(err)?;
+                let mut file = std::fs::File::open(source).map_err(|e| format!("{source}: {e}"))?;
+                vol.0.write_staged(stage, 0, &mut file)
+            };
+            if let Response::Error(e) = sent.map_err(err)? {
+                return Err(e);
             }
-            let ids = vol.apply(vec![Op::Create { unit, tags: tags(rest)?, content }])?;
+            let ids = vol.apply(vec![Op::CreateFrom { stage, tags }])?;
             say!("{}", ids[0].ok_or("no id returned")?);
         }
         "tag" => {

@@ -1,13 +1,16 @@
-use alloc::boxed::Box;
+extern crate std;
+
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use tagfs_backend_mem::MemUnit;
 use tagfs_core::{
-    Change, EntityId, Key, Namespace, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError, UnitId, Value,
+    Change, EntityId, Key, Namespace, Probe, Snapshot, StageId, Tag, TxnId, TxnInfo, Unit, UnitError, UnitId, Value,
 };
 use tagfs_device::{BlockDevice, DeviceError, MemDevice};
 
@@ -84,49 +87,104 @@ fn random_len(rng: &mut Rng) -> usize {
     }
 }
 
-/// 一组修改，引用的实体多半存在，偶尔不存在（应当整组失败）。
-fn random_changes(rng: &mut Rng, live: &[EntityId], next_id: &mut u64) -> Vec<Change> {
-    let mut out = Vec::new();
-    let mut live = live.to_vec();
-    for _ in 0..1 + rng.below(4) {
-        let pick = |rng: &mut Rng, live: &[EntityId]| {
-            if live.is_empty() || rng.below(30) == 0 {
-                eid(999_999)
-            } else {
-                live[rng.below(live.len() as u64) as usize]
+/// 对单元的一次操作：一组元数据修改，或者一次内容写入、截断。
+#[derive(Debug)]
+enum Op {
+    /// 修改里 `Create` 的 `content` 是 `contents` 的下标，用的时候换成这个单元里写好的暂存。
+    Changes(Vec<Change>, Vec<Vec<u8>>),
+    Write(EntityId, u64, Vec<u8>),
+    SetLen(EntityId, u64),
+}
+
+/// 新建实体的修改，内容先写进暂存。
+fn create(unit: &dyn Unit, id: EntityId, tags: Vec<Tag>, content: &[u8]) -> Result<(), UnitError> {
+    let op = Op::Changes(vec![Change::Create { id, tags, content: Some(StageId(0)) }], vec![content.to_vec()]);
+    run(unit, &op)
+}
+
+fn run(unit: &dyn Unit, op: &Op) -> Result<(), UnitError> {
+    match op {
+        Op::Changes(changes, contents) => {
+            let mut stages = Vec::new();
+            for c in contents {
+                let s = unit.stage()?;
+                stages.push(s);
+                unit.write_staged(s, 0, c)?;
             }
-        };
-        let c = match rng.below(10) {
-            0 | 1 => {
-                *next_id += 1;
-                let id = eid(*next_id);
-                live.push(id);
-                let n = random_len(rng);
-                Change::Create { id, tags: (0..rng.below(4)).map(|_| random_tag(rng)).collect(), content: rng.bytes(n) }
+            let changes: Vec<Change> = changes
+                .iter()
+                .map(|c| match c {
+                    Change::Create { id, tags, content: Some(i) } => {
+                        Change::Create { id: *id, tags: tags.clone(), content: Some(stages[i.0 as usize]) }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            let r = unit.apply(&changes);
+            if r.is_err() {
+                // 设备坏了的时候丢也丢不掉；重新挂载时单元自己回收。
+                for s in stages {
+                    let _ = unit.discard_staged(s);
+                }
             }
-            2 => {
-                *next_id += 1;
-                let id = eid(*next_id);
-                let from = pick(rng, &live);
-                live.push(id);
-                Change::Copy { from, id, tags: vec![random_tag(rng)] }
-            }
-            3 => {
-                let id = pick(rng, &live);
-                live.retain(|x| *x != id);
-                Change::Delete { id }
-            }
-            4 | 5 => Change::AddTag { id: pick(rng, &live), tag: random_tag(rng) },
-            6 => Change::RemoveTag { id: pick(rng, &live), tag: random_tag(rng) },
-            7 | 8 => {
-                let n = random_len(rng);
-                Change::Write { id: pick(rng, &live), offset: rng.below(12 * BS as u64), data: rng.bytes(n) }
-            }
-            _ => Change::Truncate { id: pick(rng, &live), len: random_len(rng) as u64 },
-        };
-        out.push(c);
+            r
+        }
+        Op::Write(id, offset, data) => unit.write(id, *offset, data),
+        Op::SetLen(id, len) => unit.set_len(id, *len),
     }
-    out
+}
+
+/// 一次随机操作，引用的实体多半存在，偶尔不存在（应当整组失败）。
+fn random_op(rng: &mut Rng, live: &[EntityId], next_id: &mut u64) -> Op {
+    let pick = |rng: &mut Rng, live: &[EntityId]| {
+        if live.is_empty() || rng.below(30) == 0 { eid(999_999) } else { live[rng.below(live.len() as u64) as usize] }
+    };
+    match rng.below(10) {
+        0..=2 => {
+            let n = random_len(rng);
+            Op::Write(pick(rng, live), rng.below(12 * BS as u64), rng.bytes(n))
+        }
+        3 => Op::SetLen(pick(rng, live), random_len(rng) as u64),
+        _ => {
+            let mut out = Vec::new();
+            let mut contents = Vec::new();
+            let mut live = live.to_vec();
+            for _ in 0..1 + rng.below(4) {
+                let c = match rng.below(7) {
+                    0 | 1 => {
+                        *next_id += 1;
+                        let id = eid(*next_id);
+                        live.push(id);
+                        let tags = (0..rng.below(4)).map(|_| random_tag(rng)).collect();
+                        let content = if rng.below(4) == 0 {
+                            None
+                        } else {
+                            let n = random_len(rng);
+                            contents.push(rng.bytes(n));
+                            Some(StageId(contents.len() as u64 - 1))
+                        };
+                        Change::Create { id, tags, content }
+                    }
+                    2 => {
+                        *next_id += 1;
+                        let id = eid(*next_id);
+                        let from = pick(rng, &live);
+                        live.push(id);
+                        Change::Copy { from, id, tags: vec![random_tag(rng)] }
+                    }
+                    3 => {
+                        let id = pick(rng, &live);
+                        live.retain(|x| *x != id);
+                        Change::Delete { id }
+                    }
+                    4 | 5 => Change::AddTag { id: pick(rng, &live), tag: random_tag(rng) },
+                    _ => Change::RemoveTag { id: pick(rng, &live), tag: random_tag(rng) },
+                };
+                out.push(c);
+            }
+            Op::Changes(out, contents)
+        }
+    }
 }
 
 /// 一组索引查询的参数：同一个键上的等值、范围、前缀。
@@ -194,7 +252,7 @@ fn format_and_reopen_an_empty_unit() {
 #[test]
 fn rejects_what_it_cannot_use() {
     assert!(!crate::is_formatted(&mem_device(64)));
-    assert!(crate::is_formatted(&*fresh(64).device()));
+    assert!(crate::is_formatted(fresh(64).device()));
     assert_eq!(BlockUnit::open(mem_device(64)).err(), Some(OpenError::NotFormatted));
     assert_eq!(BlockUnit::format(MemDevice::new(64 * 512, 512), UNIT).err(), Some(OpenError::BadBlockSize));
     assert_eq!(BlockUnit::format(mem_device(4), UNIT).err(), Some(OpenError::TooSmall));
@@ -203,15 +261,15 @@ fn rejects_what_it_cannot_use() {
 #[test]
 fn behaves_like_the_reference_unit() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut block = fresh(2048);
-    let mut reference = MemUnit::new(UNIT);
+    let block = fresh(2048);
+    let reference = MemUnit::new(UNIT);
     let mut next_id = 0;
-    for round in 0..300 {
+    for round in 0..400 {
         let live = reference.snapshot().all().unwrap();
-        let changes = random_changes(&mut rng, &live, &mut next_id);
-        let expect = reference.apply(&changes);
-        let got = block.apply(&changes);
-        assert_eq!(got, expect, "round {round}: {changes:?}");
+        let op = random_op(&mut rng, &live, &mut next_id);
+        let expect = run(&reference, &op);
+        let got = run(&block, &op);
+        assert_eq!(got, expect, "round {round}: {op:?}");
         let (a, b) = (block.snapshot(), reference.snapshot());
         assert_eq!(dump(&*a), dump(&*b), "round {round}");
         if round % 25 == 0 {
@@ -220,7 +278,8 @@ fn behaves_like_the_reference_unit() {
         }
     }
     block.verify().unwrap();
-    // 重新挂载后内容不变。
+    // 落盘之后重新挂载，内容不变。
+    block.sync().unwrap();
     let reopened = BlockUnit::open(block.device().crash(usize::MAX)).unwrap();
     reopened.verify().unwrap();
     assert_eq!(dump(&*reopened.snapshot()), dump(&*reference.snapshot()));
@@ -229,8 +288,8 @@ fn behaves_like_the_reference_unit() {
 
 #[test]
 fn tags_up_to_the_length_limit_work() {
-    let mut block = fresh(2048);
-    let mut reference = MemUnit::new(UNIT);
+    let block = fresh(2048);
+    let reference = MemUnit::new(UNIT);
     // 最坏情况：全是 NUL，转义后翻倍。
     let longest = |c: char| Tag::new("user", "path", c.to_string().repeat(tagfs_core::tag::MAX_STR_LEN));
     let mut changes = Vec::new();
@@ -240,9 +299,9 @@ fn tags_up_to_the_length_limit_work() {
         if let Value::Str(s) = &mut tag.value {
             s.truncate(s.len() - i as usize);
         }
-        changes.push(Change::Create { id: eid(i), tags: vec![tag, Tag::new("user", "n", i)], content: vec![] });
+        changes.push(Change::Create { id: eid(i), tags: vec![tag, Tag::new("user", "n", i)], content: None });
     }
-    for unit in [&mut block as &mut dyn Unit, &mut reference] {
+    for unit in [&block as &dyn Unit, &reference] {
         unit.apply(&changes).unwrap();
         unit.apply(&[Change::Delete { id: eid(7) }, Change::RemoveTag { id: eid(8), tag: longest('\0') }]).unwrap();
     }
@@ -262,7 +321,7 @@ fn tags_up_to_the_length_limit_work() {
 
 #[test]
 fn deleting_everything_gives_all_space_back() {
-    let mut unit = fresh(512);
+    let unit = fresh(512);
     let empty = unit.free_blocks();
     let mut rng = Rng(42);
     let mut ids = Vec::new();
@@ -271,9 +330,9 @@ fn deleting_everything_gives_all_space_back() {
         ids.push(id);
         let n = random_len(&mut rng);
         let content = rng.bytes(n);
-        unit.apply(&[Change::Create { id, tags: vec![random_tag(&mut rng)], content }]).unwrap();
+        create(&unit, id, vec![random_tag(&mut rng)], &content).unwrap();
         unit.apply(&[Change::Copy { from: id, id: eid(1000 + i), tags: vec![] }]).unwrap();
-        unit.apply(&[Change::Write { id: eid(1000 + i), offset: 5000, data: vec![1; 9000] }]).unwrap();
+        unit.write(&eid(1000 + i), 5000, &[1; 9000]).unwrap();
     }
     unit.verify().unwrap();
     let deletes: Vec<Change> =
@@ -286,23 +345,20 @@ fn deleting_everything_gives_all_space_back() {
 
 #[test]
 fn a_snapshot_keeps_seeing_its_version() {
-    let mut unit = fresh(2048);
+    let unit = fresh(2048);
     let id = eid(1);
     let old: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
-    unit.apply(&[Change::Create { id, tags: vec![Tag::flag("user", "old")], content: old.clone() }]).unwrap();
+    create(&unit, id, vec![Tag::flag("user", "old")], &old).unwrap();
     let snap = unit.snapshot();
     for i in 0..30u8 {
-        unit.apply(&[
-            Change::Write { id, offset: 0, data: vec![i; 40_000] },
-            Change::RemoveTag { id, tag: Tag::flag("user", "old") },
-            Change::Create { id: eid(100 + i as u64), tags: vec![], content: vec![i; 9000] },
-        ])
-        .unwrap();
+        unit.write(&id, 0, &[i; 40_000]).unwrap();
+        unit.apply(&[Change::RemoveTag { id, tag: Tag::flag("user", "old") }]).unwrap();
+        create(&unit, eid(100 + i as u64), vec![], &[i; 9000]).unwrap();
         unit.apply(&[Change::Delete { id: eid(100 + i as u64) }]).unwrap();
     }
     assert_eq!(dump(&*snap)[&id], (vec![Tag::flag("user", "old")], old));
     unit.verify().unwrap();
-    // 旧快照在读的块不能再分配；放掉之后，下一次提交时回到可分配的空间。
+    // 旧快照在读的块不能再分配；放掉之后，下一次改动时回到可分配的空间。
     assert!(unit.pinned_blocks() > 30 * 10);
     drop(snap);
     unit.apply(&[Change::AddTag { id, tag: Tag::flag("user", "x") }]).unwrap();
@@ -312,33 +368,78 @@ fn a_snapshot_keeps_seeing_its_version() {
 
 #[test]
 fn running_out_of_space_changes_nothing() {
-    let mut unit = fresh(64);
+    let unit = fresh(64);
     let id = eid(1);
-    unit.apply(&[Change::Create { id, tags: vec![], content: vec![1; 100_000] }]).unwrap();
+    create(&unit, id, vec![], &[1; 100_000]).unwrap();
     let before = dump(&*unit.snapshot());
-    let big = Change::Create { id: eid(2), tags: vec![], content: vec![2; 200_000] };
-    assert_eq!(unit.apply(&[big]), Err(UnitError::NoSpace));
+    // 暂存写不下：报空间不足，单元不变。
+    assert_eq!(create(&unit, eid(2), vec![], &[2; 200_000]), Err(UnitError::NoSpace));
+    assert_eq!(unit.write(&id, 100_000, &[3; 200_000]), Err(UnitError::NoSpace));
     assert_eq!(dump(&*unit.snapshot()), before);
     unit.verify().unwrap();
     unit.apply(&[Change::Delete { id }]).unwrap();
-    unit.apply(&[Change::Create { id: eid(2), tags: vec![], content: vec![2; 200_000] }]).unwrap();
+    create(&unit, eid(2), vec![], &[2; 200_000]).unwrap();
     unit.verify().unwrap();
 }
 
 #[test]
+fn writes_are_visible_at_once_and_durable_after_sync() {
+    let unit = fresh(512);
+    let id = eid(1);
+    create(&unit, id, vec![], b"committed").unwrap();
+    unit.write(&id, 0, &[7; 30_000]).unwrap();
+    assert_eq!(dump(&*unit.snapshot())[&id].1, vec![7; 30_000]);
+    unit.verify().unwrap();
+    // 没落盘就断电：回到上一次提交的内容，空间也都在。
+    let lost = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    lost.verify().unwrap();
+    assert_eq!(dump(&*lost.snapshot())[&id].1, b"committed");
+    unit.sync().unwrap();
+    let kept = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    kept.verify().unwrap();
+    assert_eq!(dump(&*kept.snapshot())[&id].1, vec![7; 30_000]);
+}
+
+#[test]
+fn unused_stages_are_reclaimed() {
+    let unit = fresh(512);
+    let empty = unit.free_blocks();
+    let a = unit.stage().unwrap();
+    unit.write_staged(a, 0, &[1; 50_000]).unwrap();
+    let b = unit.stage().unwrap();
+    unit.write_staged(b, 0, &[2; 50_000]).unwrap();
+    unit.discard_staged(b).unwrap();
+    assert_eq!(unit.write_staged(b, 0, b"x"), Err(UnitError::UnknownStage(b)));
+    unit.verify().unwrap();
+    // 落了盘的暂存没被用上：重新挂载时回收。
+    unit.sync().unwrap();
+    let back = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    back.verify().unwrap();
+    assert_eq!(back.write_staged(a, 0, b"x"), Err(UnitError::UnknownStage(a)));
+    assert_eq!(back.free_blocks(), empty);
+}
+
+#[test]
 fn prepared_transactions_survive_a_restart() {
-    let mut unit = fresh(256);
+    let unit = fresh(256);
     let a = eid(1);
-    unit.apply(&[Change::Create { id: a, tags: vec![], content: b"a".to_vec() }]).unwrap();
+    create(&unit, a, vec![], b"a").unwrap();
     let info = TxnInfo { id: TxnId([3; 16]), primary: UNIT, participants: vec![UNIT, UnitId([8; 16])] };
+    let stage = unit.stage().unwrap();
+    unit.write_staged(stage, 0, &[5; 5000]).unwrap();
     let changes = vec![
         Change::AddTag { id: a, tag: Tag::new("tagfs", "txn_pending", "t") },
-        Change::Create { id: eid(2), tags: vec![], content: vec![5; 5000] },
+        Change::Create { id: eid(2), tags: vec![], content: Some(stage) },
     ];
+    assert_eq!(
+        unit.prepare(&info, &[Change::Create { id: eid(3), tags: vec![], content: Some(StageId(999)) }]),
+        Err(UnitError::UnknownStage(StageId(999)))
+    );
     unit.prepare(&info, &changes).unwrap();
     assert_eq!(unit.snapshot().all().unwrap(), vec![a], "prepared changes are not visible yet");
 
-    let mut unit = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    // 准备记录引用的暂存随它一起保留下来。
+    let unit = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
     assert_eq!(unit.prepared().unwrap(), vec![(info.clone(), changes)]);
     unit.commit_prepared(info.id, true).unwrap();
     assert!(unit.prepared().unwrap().is_empty());
@@ -348,19 +449,28 @@ fn prepared_transactions_survive_a_restart() {
     assert!(unit.committed().unwrap().is_empty());
     assert_eq!(unit.abort_prepared(info.id), Err(UnitError::UnknownTxn(info.id)));
     unit.verify().unwrap();
+
+    // 放弃的事务把它占着的暂存一并丢掉。
+    let empty = unit.free_blocks();
+    let stage = unit.stage().unwrap();
+    unit.write_staged(stage, 0, &[6; 20_000]).unwrap();
+    unit.prepare(&info, &[Change::Create { id: eid(4), tags: vec![], content: Some(stage) }]).unwrap();
+    unit.abort_prepared(info.id).unwrap();
+    unit.verify().unwrap();
+    assert_eq!(unit.free_blocks(), empty);
 }
 
 #[test]
 fn aux_records_commit_together_with_changes() {
     use crate::{Aux, Batch};
-    let mut unit = fresh(128);
-    let changes = [Change::Create { id: eid(1), tags: vec![], content: b"x".to_vec() }];
+    let unit = fresh(128);
+    let changes = [Change::Create { id: eid(1), tags: vec![], content: None }];
     let aux = [Aux::Put(b"log/1".to_vec(), b"a".to_vec()), Aux::Put(b"log/2".to_vec(), b"b".to_vec())];
-    unit.commit_batch(&mut Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
+    unit.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
     // 修改失败时附加记录也不生效。
     let bad = [Change::Delete { id: eid(9) }];
     let more = [Aux::Delete(b"log/1".to_vec())];
-    assert!(unit.commit_batch(&mut Batch { changes: &bad, aux: &more, ..Batch::default() }).is_err());
+    assert!(unit.commit_batch(&Batch { changes: &bad, aux: &more, ..Batch::default() }).is_err());
     let unit = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
     assert_eq!(unit.aux_get(b"log/1").unwrap(), Some(b"a".to_vec()));
     assert_eq!(unit.aux_list(b"log/").unwrap().len(), 2);
@@ -369,51 +479,82 @@ fn aux_records_commit_together_with_changes() {
 }
 
 #[test]
+fn adopting_a_stage_replaces_the_content() {
+    use crate::Batch;
+    let unit = fresh(2048);
+    create(&unit, eid(1), vec![], b"old").unwrap();
+    let stage = unit.stage().unwrap();
+    // 分段写进暂存，不必整个放进内存。
+    let chunk: Vec<u8> = (0..1_000_000u32).map(|i| (i % 253) as u8).collect();
+    for i in 0..3u64 {
+        unit.write_staged(stage, i * chunk.len() as u64, &chunk).unwrap();
+    }
+    unit.commit_batch(&Batch { adopt: &[(eid(1), stage)], ..Batch::default() }).unwrap();
+    let got = &dump(&*unit.snapshot())[&eid(1)].1;
+    assert_eq!(got.len(), 3_000_000);
+    assert!(got.chunks(chunk.len()).all(|c| c == chunk.as_slice()));
+    unit.verify().unwrap();
+}
+
+#[test]
 fn a_growable_device_grows_instead_of_running_out() {
     let dev = MemDevice::growable(16 * BS as u64, 64 << 20, BS);
-    let mut unit = BlockUnit::format(dev, UNIT).unwrap();
+    let unit = BlockUnit::format(dev, UNIT).unwrap();
     let mut rng = Rng(3);
     let big = rng.bytes(3 << 20);
-    unit.apply(&[Change::Create { id: eid(1), tags: vec![], content: big.clone() }]).unwrap();
+    create(&unit, eid(1), vec![], &big).unwrap();
     assert!(unit.total_blocks() > 16);
     unit.verify().unwrap();
     let back = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
     back.verify().unwrap();
     assert_eq!(dump(&*back.snapshot())[&eid(1)].1, big);
     // 扩到设备上限还不够，才报空间不足。
-    let mut unit = back;
-    let huge = Change::Create { id: eid(2), tags: vec![], content: vec![1; 80 << 20] };
-    assert_eq!(unit.apply(&[huge]), Err(UnitError::NoSpace));
-    unit.verify().unwrap();
+    assert_eq!(create(&back, eid(2), vec![], &vec![1; 80 << 20]), Err(UnitError::NoSpace));
+    back.verify().unwrap();
 }
 
 #[test]
-fn fill_streams_content_from_a_source() {
-    use crate::{Batch, Fill, Source};
-    struct Counting(u64);
-    impl Source for Counting {
-        fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, UnitError> {
-            let n = (self.0.saturating_sub(offset) as usize).min(buf.len());
-            for (i, b) in buf[..n].iter_mut().enumerate() {
-                *b = ((offset as usize + i) % 253) as u8;
-            }
-            Ok(n)
-        }
+fn readers_and_writers_on_different_entities_do_not_wait_for_each_other() {
+    let unit = Arc::new(fresh(8192));
+    let ids: Vec<EntityId> = (0..4).map(eid).collect();
+    for id in &ids {
+        create(&*unit, *id, vec![], b"").unwrap();
     }
-    let mut unit = fresh(2048);
-    unit.apply(&[Change::Create { id: eid(1), tags: vec![], content: b"old".to_vec() }]).unwrap();
-    let mut src = Counting(2_500_000);
-    unit.commit_batch(&mut Batch { fills: vec![Fill { id: eid(1), source: &mut src }], ..Batch::default() }).unwrap();
-    let got = &dump(&*unit.snapshot())[&eid(1)].1;
-    assert_eq!(got.len(), 2_500_000);
-    assert!(got.iter().enumerate().all(|(i, b)| *b == (i % 253) as u8));
+    std::thread::scope(|s| {
+        for (n, id) in ids.iter().enumerate() {
+            let unit = &unit;
+            s.spawn(move || {
+                for i in 0..40u64 {
+                    unit.write(id, i * 10_000, &vec![n as u8 + 1; 10_000]).unwrap();
+                    // 同时有人在读整个单元。
+                    let _ = dump(&*unit.snapshot());
+                }
+            });
+        }
+    });
     unit.verify().unwrap();
+    unit.sync().unwrap();
+    let back = BlockUnit::open(unit.device().crash(usize::MAX)).unwrap();
+    back.verify().unwrap();
+    let all = dump(&*back.snapshot());
+    for (n, id) in ids.iter().enumerate() {
+        assert_eq!(all[id].1, vec![n as u8 + 1; 400_000]);
+    }
 }
 
 /// 写到第 `budget` 次就“断电”的设备：之后的写入和刷盘都失败。
 struct Budget {
     inner: MemDevice,
-    budget: u64,
+    budget: AtomicU64,
+}
+
+impl Budget {
+    fn spend(&self) -> Result<(), DeviceError> {
+        self.budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| DeviceError::Io)
+    }
 }
 
 impl BlockDevice for Budget {
@@ -429,80 +570,79 @@ impl BlockDevice for Budget {
         self.inner.read_at(offset, buf)
     }
 
-    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
-        if self.budget == 0 {
-            return Err(DeviceError::Io);
-        }
-        self.budget -= 1;
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
+        self.spend()?;
         self.inner.write_at(offset, buf)
     }
 
-    fn flush(&mut self) -> Result<(), DeviceError> {
-        if self.budget == 0 {
+    fn flush(&self) -> Result<(), DeviceError> {
+        if self.budget.load(Ordering::SeqCst) == 0 {
             return Err(DeviceError::Io);
         }
         self.inner.flush()
     }
 
-    fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError> {
+    fn trim(&self, offset: u64, len: u64) -> Result<(), DeviceError> {
         self.inner.trim(offset, len)
     }
 }
 
-/// 在一次提交的每一次写入处断电，并且未刷盘的写入落下任意前缀：重新挂载后，
-/// 要么是提交前的状态，要么是提交后的状态，而且空间记账没有错。
+/// 在一次操作（随后落盘）的每一次写入处断电，并且未刷盘的写入落下任意前缀：重新挂载后，
+/// 要么是操作前的状态，要么是操作后的状态，而且空间记账没有错。
 #[test]
 fn power_loss_at_any_write_leaves_old_or_new_state() {
     let mut rng = Rng(7);
-    let mut base = fresh(512);
+    let base = fresh(512);
     let mut next_id = 0;
-    let mut reference = MemUnit::new(UNIT);
+    let reference = MemUnit::new(UNIT);
     for _ in 0..12 {
         let live = reference.snapshot().all().unwrap();
-        let changes = random_changes(&mut rng, &live, &mut next_id);
-        if reference.apply(&changes).is_ok() {
-            base.apply(&changes).unwrap();
+        let op = random_op(&mut rng, &live, &mut next_id);
+        if run(&reference, &op).is_ok() {
+            run(&base, &op).unwrap();
         }
     }
-    for round in 0..15 {
+    base.sync().unwrap();
+    for round in 0..20 {
         let before = dump(&*reference.snapshot());
         let live = reference.snapshot().all().unwrap();
-        let changes = random_changes(&mut rng, &live, &mut next_id);
-        if reference.apply(&changes).is_err() {
+        let op = random_op(&mut rng, &live, &mut next_id);
+        if run(&reference, &op).is_err() {
             continue;
         }
         let after = dump(&*reference.snapshot());
         let image = base.device().crash(usize::MAX);
         for budget in 0.. {
-            let dev = Budget { inner: image.crash(usize::MAX), budget };
-            let mut unit = BlockUnit::open(dev).unwrap();
-            let done = unit.apply(&changes).is_ok();
+            let dev = Budget { inner: image.crash(usize::MAX), budget: AtomicU64::new(budget) };
+            let unit = BlockUnit::open(dev).unwrap();
+            let done = run(&unit, &op).and_then(|()| unit.sync()).is_ok();
             let pending = unit.device().inner.pending_writes();
             for keep in 0..=pending {
                 let crashed = unit.device().inner.crash(keep);
                 let back = BlockUnit::open(crashed).unwrap();
                 back.verify().unwrap();
                 let state = dump(&*back.snapshot());
-                assert!(state == before || state == after, "round {round} budget {budget} keep {keep}");
+                assert!(state == before || state == after, "round {round} budget {budget} keep {keep}: {op:?}");
                 if done {
-                    assert!(state == after, "a finished commit must survive");
+                    assert!(state == after, "a finished sync must survive");
                 }
             }
             if done {
                 break;
             }
         }
-        base.apply(&changes).unwrap();
+        run(&base, &op).unwrap();
+        base.sync().unwrap();
     }
 }
 
 #[test]
 fn a_damaged_superblock_falls_back_to_the_other() {
-    let mut unit = fresh(128);
-    unit.apply(&[Change::Create { id: eid(1), tags: vec![], content: b"one".to_vec() }]).unwrap();
+    let unit = fresh(128);
+    create(&unit, eid(1), vec![], b"one").unwrap();
     let one = dump(&*unit.snapshot());
-    unit.apply(&[Change::Create { id: eid(2), tags: vec![], content: b"two".to_vec() }]).unwrap();
-    let mut dev = unit.device().crash(usize::MAX);
+    create(&unit, eid(2), vec![], b"two").unwrap();
+    let dev = unit.device().crash(usize::MAX);
     // 最新的超级块写坏了一个字节。
     let slot = unit.generation() % 2;
     dev.write_at(slot * BS as u64 + 30, &[0xaa]).unwrap();
@@ -536,12 +676,14 @@ fn works_as_a_volume_unit() {
     };
     let one = BlockUnit::format(mem_device(256), UnitId([1; 16])).unwrap();
     let two = BlockUnit::format(mem_device(256), UnitId([2; 16])).unwrap();
-    let mut v = Volume::new(rules(), Box::new(Ids(0)));
-    v.attach(Box::new(one)).unwrap();
-    v.attach(Box::new(two)).unwrap();
+    let v = Volume::new(rules(), alloc::boxed::Box::new(Ids(0)));
+    v.attach(Arc::new(one)).unwrap();
+    v.attach(Arc::new(two)).unwrap();
 
+    let stage = v.stage(Some(UnitId([1; 16]))).unwrap();
+    stage.write(0, &[9; 10_000]).unwrap();
     let mut tx = v.begin(&());
-    let a = tx.create(Some(UnitId([1; 16])), vec![Tag::new("user", "name", "a")], vec![9; 10_000]).unwrap();
+    let a = tx.create_from(stage, vec![Tag::new("user", "name", "a")]).unwrap();
     tx.commit().unwrap();
     let mut tx = v.begin(&());
     let b = tx.copy(&a, Some(UnitId([2; 16])), vec![Tag::new("user", "name", "b")]).unwrap();

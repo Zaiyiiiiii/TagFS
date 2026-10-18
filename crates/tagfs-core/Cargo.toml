@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "TagFS 的逻辑层：实体、Tag、可见性、查询、卷与事务"
 
+[dependencies]
+tagfs-sync = { path = "../tagfs-sync" }
+
 [lints]
 workspace = true

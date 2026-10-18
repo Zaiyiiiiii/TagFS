@@ -8,6 +8,7 @@ description = "TagFS 的块格式存储单元：写时复制 B+ 树，建在任�
 [dependencies]
 tagfs-core = { path = "../tagfs-core" }
 tagfs-device = { path = "../tagfs-device" }
+tagfs-sync = { path = "../tagfs-sync" }
 
 [dev-dependencies]
 tagfs-backend-mem = { path = "../tagfs-backend-mem" }

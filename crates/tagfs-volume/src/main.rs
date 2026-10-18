@@ -18,7 +18,7 @@ fn main() -> ExitCode {
         }
     };
     let run = || -> std::io::Result<()> {
-        let mut service = tagfs_volume::Service::start(&state)?;
+        let service = std::sync::Arc::new(tagfs_volume::Service::start(&state)?);
         let listener = tagfs_volume::listen(tagfs_proto::socket_name()?)?;
         eprintln!("tagfs-volume: serving, state in {}", state.display());
         service.serve(&listener)

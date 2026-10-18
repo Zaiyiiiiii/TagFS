@@ -38,11 +38,12 @@ pub trait Policy {
     fn on_create(&self, ctx: &Self::Context) -> Option<Vec<Tag>>;
 }
 
-type BoundaryRule<C> = Box<dyn Fn(&C, &[&Value]) -> bool>;
+// 规则会被同时处理多个请求的卷共用，所以要能跨线程。
+type BoundaryRule<C> = Box<dyn Fn(&C, &[&Value]) -> bool + Send + Sync>;
 /// 读取和写入规则：只看调用上下文。
-type WriteRule<C> = Box<dyn Fn(&C) -> bool>;
-type ModifyRule<C> = Box<dyn Fn(&C, &[Tag]) -> bool>;
-type CreateRule<C> = Box<dyn Fn(&C) -> Option<Vec<Tag>>>;
+type WriteRule<C> = Box<dyn Fn(&C) -> bool + Send + Sync>;
+type ModifyRule<C> = Box<dyn Fn(&C, &[Tag]) -> bool + Send + Sync>;
+type CreateRule<C> = Box<dyn Fn(&C) -> Option<Vec<Tag>> + Send + Sync>;
 
 /// 逐条注册的规则。没有注册的一律拒绝：没有读取规则的命名空间谁都看不到，没有写入规则的命名空间谁都不能写，
 /// 没有修改规则就谁都不能改实体，没有创建规则就谁都不能创建。
@@ -72,29 +73,34 @@ impl<C> Rules<C> {
     }
 
     /// 把实体上的 `ns:key` 注册为边界，`rule` 判断主体能否越过。
-    pub fn boundary(mut self, ns: &str, key: &str, rule: impl Fn(&C, &[&Value]) -> bool + 'static) -> Self {
+    pub fn boundary(
+        mut self,
+        ns: &str,
+        key: &str,
+        rule: impl Fn(&C, &[&Value]) -> bool + Send + Sync + 'static,
+    ) -> Self {
         self.boundaries.insert((Namespace::new(ns), Key::new(key)), Box::new(rule));
         self
     }
 
     /// 注册命名空间 `ns` 的读取规则（包括 `tagfs`）。
-    pub fn reader(mut self, ns: &str, rule: impl Fn(&C) -> bool + 'static) -> Self {
+    pub fn reader(mut self, ns: &str, rule: impl Fn(&C) -> bool + Send + Sync + 'static) -> Self {
         self.readers.insert(Namespace::new(ns), Box::new(rule));
         self
     }
 
     /// 注册命名空间 `ns` 的写入规则。`tagfs` 命名空间注册了也不生效。
-    pub fn writer(mut self, ns: &str, rule: impl Fn(&C) -> bool + 'static) -> Self {
+    pub fn writer(mut self, ns: &str, rule: impl Fn(&C) -> bool + Send + Sync + 'static) -> Self {
         self.writers.insert(Namespace::new(ns), Box::new(rule));
         self
     }
 
-    pub fn modify(mut self, rule: impl Fn(&C, &[Tag]) -> bool + 'static) -> Self {
+    pub fn modify(mut self, rule: impl Fn(&C, &[Tag]) -> bool + Send + Sync + 'static) -> Self {
         self.modify = Some(Box::new(rule));
         self
     }
 
-    pub fn create(mut self, rule: impl Fn(&C) -> Option<Vec<Tag>> + 'static) -> Self {
+    pub fn create(mut self, rule: impl Fn(&C) -> Option<Vec<Tag>> + Send + Sync + 'static) -> Self {
         self.create = Some(Box::new(rule));
         self
     }
