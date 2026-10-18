@@ -1,0 +1,13 @@
+[package]
+name = "tagfs-block"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的块格式存储单元：写时复制 B+ 树，建在任意块设备上"
+
+[dependencies]
+tagfs-core = { path = "../tagfs-core" }
+tagfs-device = { path = "../tagfs-device" }
+
+[lints]
+workspace = true

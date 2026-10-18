@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "tagfs-block"
+version = "0.1.0"
+dependencies = [
+ "tagfs-core",
+ "tagfs-device",
+]
+
+[[package]]
 name = "tagfs-core"
 version = "0.1.0"
 
