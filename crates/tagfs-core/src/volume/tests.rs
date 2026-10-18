@@ -32,6 +32,12 @@ fn rules() -> Rules<Ctx> {
         .boundary("system", "owner_user", |c: &Ctx, vs| c.all_users || vs.iter().any(|v| is(v, c.user)))
         // “读取所有用户文件”的能力只放宽用户边界，不放宽应用边界。
         .boundary("system", "owner_app", |c: &Ctx, vs| vs.iter().any(|v| is(v, c.app)))
+        .reader("user", |_| true)
+        .reader("system", |_| true)
+        .reader("tagfs", |_| true)
+        // `app` 命名空间只有播放器自己看得到、写得了。
+        .reader("app", |c: &Ctx| c.app == "player")
+        .writer("app", |c: &Ctx| c.app == "player")
         .writer("user", |_| true)
         .modify(|c: &Ctx, tags| tags.iter().any(|t| t.key.as_str() == "owner_user" && is(&t.value, c.user)))
         .create(|c: &Ctx| {
@@ -139,6 +145,44 @@ fn namespace_write_rules_default_to_deny() {
     assert!(tx.add_tag(&a, name("fine")).is_ok());
     assert_eq!(tx.add_tag(&a, name(&"x".repeat(4097))), Err(Error::TagTooLong));
     assert!(tx.add_tag(&a, name(&"x".repeat(4096))).is_ok());
+}
+
+#[test]
+fn tags_in_unreadable_namespaces_do_not_exist_for_the_caller() {
+    let mut v = volume(&[1]);
+    let a = create(&mut v, &ALICE_IN_PLAYER, None, vec![name("song"), Tag::new("app", "plays", 3u64)], b"");
+    let b = create(&mut v, &ALICE, None, vec![name("note")], b"");
+    // 播放器看得到自己的 Tag，别的应用看不到，也查不到。
+    assert!(v.get(&ALICE_IN_PLAYER, &a).unwrap().tags.contains(&Tag::new("app", "plays", 3u64)));
+    assert_eq!(v.get(&ALICE, &a).unwrap().tags.len(), 2, "name and owner only");
+    assert_eq!(v.query(&ALICE_IN_PLAYER, &Query::has("app", "plays")).unwrap(), vec![a]);
+    assert!(v.query(&ALICE, &Query::has("app", "plays")).unwrap().is_empty());
+    let mut both = vec![a, b];
+    both.sort();
+    assert_eq!(v.query(&ALICE, &Query::Not(Box::new(Query::has("app", "plays")))).unwrap(), both);
+}
+
+#[test]
+fn queries_can_be_read_page_by_page() {
+    let mut v = volume(&[1, 2]);
+    let mut all = Vec::new();
+    for i in 0..7 {
+        all.push(create(&mut v, &ALICE, Some(1 + i % 2), vec![name("x")], b""));
+    }
+    all.sort();
+    let q = Query::has("user", "name");
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = v.query_page(&ALICE, &q, after.as_ref(), 3).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 3);
+        after = page.last().copied();
+        seen.extend(page);
+    }
+    assert_eq!(seen, all);
 }
 
 #[test]

@@ -394,7 +394,12 @@ fn works_inside_a_volume() {
 
     let root = scratch("volume");
     let (dir, _) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
-    let rules = Rules::<()>::new().writer("user", |_| true).modify(|_, _| true).create(|_| Some(vec![]));
+    let rules = Rules::<()>::new()
+        .reader("user", |_| true)
+        .reader("tagfs", |_| true)
+        .writer("user", |_| true)
+        .modify(|_, _| true)
+        .create(|_| Some(vec![]));
     let mut v = Volume::new(rules, ids());
     v.attach(Box::new(MemUnit::new(UnitId([2; 16])))).unwrap();
     v.attach(Box::new(dir)).unwrap();

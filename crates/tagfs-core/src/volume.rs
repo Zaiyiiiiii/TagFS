@@ -151,9 +151,15 @@ impl<P: Policy> Volume<P> {
         self.locate(id)?.filter(|(_, r)| self.visible(ctx, &r.tags)).ok_or(Error::NotFound)
     }
 
+    /// 调用者看得到的那部分 Tag。
+    fn readable(&self, ctx: &P::Context, tags: Vec<Tag>) -> Vec<Tag> {
+        tags.into_iter().filter(|t| self.policy.can_read(ctx, &t.ns)).collect()
+    }
+
+    /// 实体的 Tag（只含调用者看得到的命名空间）和长度。
     pub fn get(&self, ctx: &P::Context, id: &EntityId) -> Result<Entity, Error> {
         let (_, r) = self.visible_record(ctx, id)?;
-        Ok(Entity { id: r.id, tags: r.tags, size: r.size })
+        Ok(Entity { id: r.id, tags: self.readable(ctx, r.tags), size: r.size })
     }
 
     pub fn read(&self, ctx: &P::Context, id: &EntityId, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
@@ -162,8 +168,19 @@ impl<P: Policy> Volume<P> {
         Ok(self.units[i].snapshot().read(id, offset, buf)?)
     }
 
-    /// 满足条件、且对调用者可见的实体，按 EntityId 排序。
+    /// 满足条件、且对调用者可见的实体，按 EntityId 排序。条件只对调用者看得到的 Tag 判断。
     pub fn query(&self, ctx: &P::Context, query: &Query) -> Result<Vec<EntityId>, Error> {
+        self.query_page(ctx, query, None, usize::MAX)
+    }
+
+    /// 分页查询：EntityId 大于 `after` 的结果中最前面的至多 `limit` 个。拿上一页的最后一个作为下一页的 `after`。
+    pub fn query_page(
+        &self,
+        ctx: &P::Context,
+        query: &Query,
+        after: Option<&EntityId>,
+        limit: usize,
+    ) -> Result<Vec<EntityId>, Error> {
         let mut out = Vec::new();
         for (_, snap) in self.snapshots() {
             let candidates = match candidates(&*snap, query)? {
@@ -171,9 +188,12 @@ impl<P: Policy> Volume<P> {
                 None => snap.all()?,
             };
             for id in candidates {
+                if after.is_some_and(|a| id <= *a) {
+                    continue;
+                }
                 if let Some(r) = snap.get(&id)?
-                    && query.matches(&r.tags)
                     && self.visible(ctx, &r.tags)
+                    && query.matches(&self.readable(ctx, r.tags))
                 {
                     out.push(id);
                 }
@@ -181,6 +201,7 @@ impl<P: Policy> Volume<P> {
         }
         out.sort();
         out.dedup();
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -495,6 +516,9 @@ impl<P: Policy> Txn<'_, P> {
         self.push(unit, Change::Truncate { id: *id, len });
         Ok(())
     }
+
+    /// 放弃。什么都不生效（和直接丢掉事务一样，写出来更清楚）。
+    pub fn abort(self) {}
 
     /// 提交。要么全部生效，要么全部不生效。
     pub fn commit(self) -> Result<(), Error> {

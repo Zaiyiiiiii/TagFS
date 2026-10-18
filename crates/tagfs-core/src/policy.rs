@@ -24,6 +24,10 @@ pub trait Policy {
     /// 实体可见，当且仅当它身上的每一道边界都能越过。
     fn crosses(&self, ctx: &Self::Context, ns: &Namespace, key: &Key, values: &[&Value]) -> bool;
 
+    /// 主体能否看到这个命名空间里的 Tag。看不到的 Tag 不出现在实体的 Tag 列表里，查询条件用到它也匹配不上，
+    /// 对这个主体来说等同于不存在。边界判断不受影响：边界照样按实体上的全部 Tag 判断。
+    fn can_read(&self, ctx: &Self::Context, ns: &Namespace) -> bool;
+
     /// 主体能否在一个对它可见的实体上增删这个命名空间的 Tag。
     fn can_write(&self, ctx: &Self::Context, ns: &Namespace) -> bool;
 
@@ -35,14 +39,16 @@ pub trait Policy {
 }
 
 type BoundaryRule<C> = Box<dyn Fn(&C, &[&Value]) -> bool>;
+/// 读取和写入规则：只看调用上下文。
 type WriteRule<C> = Box<dyn Fn(&C) -> bool>;
 type ModifyRule<C> = Box<dyn Fn(&C, &[Tag]) -> bool>;
 type CreateRule<C> = Box<dyn Fn(&C) -> Option<Vec<Tag>>>;
 
-/// 逐条注册的规则。没有注册的一律拒绝：没有写入规则的命名空间谁都不能写，
+/// 逐条注册的规则。没有注册的一律拒绝：没有读取规则的命名空间谁都看不到，没有写入规则的命名空间谁都不能写，
 /// 没有修改规则就谁都不能改实体，没有创建规则就谁都不能创建。
 pub struct Rules<C> {
     boundaries: BTreeMap<(Namespace, Key), BoundaryRule<C>>,
+    readers: BTreeMap<Namespace, WriteRule<C>>,
     writers: BTreeMap<Namespace, WriteRule<C>>,
     modify: Option<ModifyRule<C>>,
     create: Option<CreateRule<C>>,
@@ -50,7 +56,13 @@ pub struct Rules<C> {
 
 impl<C> Default for Rules<C> {
     fn default() -> Self {
-        Rules { boundaries: BTreeMap::new(), writers: BTreeMap::new(), modify: None, create: None }
+        Rules {
+            boundaries: BTreeMap::new(),
+            readers: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            modify: None,
+            create: None,
+        }
     }
 }
 
@@ -62,6 +74,12 @@ impl<C> Rules<C> {
     /// 把实体上的 `ns:key` 注册为边界，`rule` 判断主体能否越过。
     pub fn boundary(mut self, ns: &str, key: &str, rule: impl Fn(&C, &[&Value]) -> bool + 'static) -> Self {
         self.boundaries.insert((Namespace::new(ns), Key::new(key)), Box::new(rule));
+        self
+    }
+
+    /// 注册命名空间 `ns` 的读取规则（包括 `tagfs`）。
+    pub fn reader(mut self, ns: &str, rule: impl Fn(&C) -> bool + 'static) -> Self {
+        self.readers.insert(Namespace::new(ns), Box::new(rule));
         self
     }
 
@@ -91,6 +109,10 @@ impl<C> Policy for Rules<C> {
 
     fn crosses(&self, ctx: &C, ns: &Namespace, key: &Key, values: &[&Value]) -> bool {
         self.boundaries.iter().find(|((n, k), _)| n == ns && k == key).is_some_and(|(_, rule)| rule(ctx, values))
+    }
+
+    fn can_read(&self, ctx: &C, ns: &Namespace) -> bool {
+        self.readers.get(ns).is_some_and(|rule| rule(ctx))
     }
 
     fn can_write(&self, ctx: &C, ns: &Namespace) -> bool {

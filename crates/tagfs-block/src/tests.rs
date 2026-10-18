@@ -524,7 +524,14 @@ fn works_as_a_volume_unit() {
             buf[..8].copy_from_slice(&self.0.to_be_bytes());
         }
     }
-    let rules = || Rules::<()>::new().writer("user", |_| true).modify(|_, _| true).create(|_| Some(vec![]));
+    let rules = || {
+        Rules::<()>::new()
+            .reader("user", |_| true)
+            .reader("tagfs", |_| true)
+            .writer("user", |_| true)
+            .modify(|_, _| true)
+            .create(|_| Some(vec![]))
+    };
     let one = BlockUnit::format(mem_device(256), UnitId([1; 16])).unwrap();
     let two = BlockUnit::format(mem_device(256), UnitId([2; 16])).unwrap();
     let mut v = Volume::new(rules(), Box::new(Ids(0)));
