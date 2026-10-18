@@ -1,11 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/tagfs",
     "crates/tagfs-block",
     "crates/tagfs-core",
     "crates/tagfs-device",
     "crates/tagfs-device-host",
     "crates/tagfs-dir",
+    "crates/tagfs-tools",
 ]
 
 [workspace.package]

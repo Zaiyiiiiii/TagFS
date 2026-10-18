@@ -1,0 +1,17 @@
+[package]
+name = "tagfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS：以 Tag 组织的文件系统。对外接口，组合逻辑层、各种存储单元和宿主机设备"
+
+[dependencies]
+getrandom = "0.3"
+tagfs-block = { path = "../tagfs-block" }
+tagfs-core = { path = "../tagfs-core" }
+tagfs-device = { path = "../tagfs-device" }
+tagfs-device-host = { path = "../tagfs-device-host" }
+tagfs-dir = { path = "../tagfs-dir" }
+
+[lints]
+workspace = true

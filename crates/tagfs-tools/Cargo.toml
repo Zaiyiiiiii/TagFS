@@ -1,0 +1,16 @@
+[package]
+name = "tagfs-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的命令行工具：建单元、检查、查看、读写实体和 Tag"
+
+[[bin]]
+name = "tagfs"
+path = "src/main.rs"
+
+[dependencies]
+tagfs = { path = "../tagfs" }
+
+[lints]
+workspace = true

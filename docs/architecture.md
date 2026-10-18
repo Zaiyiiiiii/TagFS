@@ -321,8 +321,8 @@ Cargo workspace：
 | `tagfs-device` | `BlockDevice` 接口、内存实现 | `no_std` + `alloc` |
 | `tagfs-device-host` | 宿主机单文件、各平台裸盘 | `std` |
 | `tagfs-dir` | 宿主机目录单元 | `std`、`tagfs-core`、`tagfs-block`（复用 B+ 树） |
-| `tagfs` | 对外 API，组合以上各层 | 以上全部 |
-| `tagfs-tools` | 创建单元、一致性检查、卷信息查看 | `std` |
+| `tagfs` | 对外 API，组合以上各层：按路径打开或新建各种单元、系统时钟和随机数的身份来源、查询游标 | 以上全部 |
+| `tagfs-tools` | 命令行工具 `tagfs`：建单元、一致性检查、单元信息、列出和查询实体、读写内容和 Tag | `std` |
 
 核心三个 crate 不依赖 `std`，将来脱离宿主运行在裸机上时，只需要换设备实现。
 
