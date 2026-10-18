@@ -7,14 +7,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use tagfs::{BlockUnit, DirUnit, EntityId, FileDevice, Query, SystemIds, Tag, Unit, Unrestricted, Volume, tagfs_keys};
+use tagfs::{DirUnit, EntityId, ImageUnit, Query, SystemIds, Tag, Unit, Unrestricted, Volume, tagfs_keys};
 
 const USAGE: &str = "\
 用法：tagfs <命令> <单元> [参数...]
 
 <单元> 是单文件单元（镜像文件或裸盘）或目录单元的目录。
 
-  mkimage <文件>                 新建单文件单元
   info <单元>                    单元信息
   check <单元>                   一致性检查（目录单元同时和目录对账）
   find <单元> [条件...]          查找满足条件的实体，列出 ID、长度、Tag
@@ -27,13 +26,26 @@ const USAGE: &str = "\
 
 Tag：ns:key（无值）、ns:key=文本、ns:key=#123（uint）。
 条件：ns:key（带这个键）、ns:key=值、ns:key^=前缀、ns:key>=值（还有 > <= <），前加 ! 取反，多个条件取“且”。
-目录单元由宿主目录后端的工具 tagfs-hostdir 建立；在目录单元里，tagfs:hostfs_path=/路径 就是文件在目录里的位置，
-增删改它就是建、删、移动文件。";
+单元由各后端自己的工具建立：单文件单元用 tagfs-file，目录单元用 tagfs-hostdir。
+在目录单元里，tagfs:hostfs_path=/路径 就是文件在目录里的位置，增删改它就是建、删、移动文件。";
+
+/// 写一行到标准输出。写不进去时返回错误（见 [`io_out`]），不像 `println!` 那样崩溃。
+macro_rules! say {
+    ($($t:tt)*) => {
+        writeln!(std::io::stdout(), $($t)*).map_err(io_out)?
+    };
+}
+
+/// 输出出错。对方先关了管道（例如接到 `head`）不算错误：返回空串，`main` 静默结束。
+fn io_out(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::BrokenPipe { String::new() } else { e.to_string() }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.is_empty() => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tagfs: {e}");
             ExitCode::from(1)
@@ -50,7 +62,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 enum Opened {
-    Image(BlockUnit<FileDevice>),
+    Image(ImageUnit),
     Dir(DirUnit),
 }
 
@@ -59,7 +71,7 @@ fn open(path: &str) -> Result<Opened, String> {
         let (unit, _) = DirUnit::open(path, Box::new(SystemIds)).map_err(err)?;
         Ok(Opened::Dir(unit))
     } else {
-        Ok(Opened::Image(tagfs::open_image(path).map_err(err)?))
+        Ok(Opened::Image(tagfs::image::open(path).map_err(err)?))
     }
 }
 
@@ -93,16 +105,12 @@ fn arg<'a>(args: &'a [String], i: usize, what: &str) -> Result<&'a str, String> 
 fn run(args: &[String]) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     if matches!(cmd, "help" | "-h" | "--help") {
-        println!("{USAGE}");
+        say!("{USAGE}");
         return Ok(());
     }
     let path = arg(args, 1, "unit")?;
     let rest = &args[2..];
     match cmd {
-        "mkimage" => {
-            let unit = tagfs::create_image(path, tagfs::new_unit_id()).map_err(err)?;
-            println!("unit {}", hex(&unit.id().0));
-        }
         "info" => info(path)?,
         "check" => check(path)?,
         "find" => {
@@ -118,7 +126,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 for id in page {
                     let e = vol.get(&(), &id).map_err(err)?;
-                    writeln!(out, "{}", line(&id, e.size, &e.tags)).map_err(err)?;
+                    writeln!(out, "{}", line(&id, e.size, &e.tags)).map_err(io_out)?;
                 }
             }
         }
@@ -126,10 +134,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let vol = volume(path)?;
             let id = entity_id(arg(args, 2, "entity id")?)?;
             let e = vol.get(&(), &id).map_err(err)?;
-            println!("id    {id}");
-            println!("size  {}", e.size);
+            say!("id    {id}");
+            say!("size  {}", e.size);
             for t in &e.tags {
-                println!("tag   {}", syntax::show_tag(t));
+                say!("tag   {}", syntax::show_tag(t));
             }
         }
         "cat" => {
@@ -144,7 +152,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 if n == 0 {
                     break;
                 }
-                out.write_all(&buf[..n]).map_err(err)?;
+                out.write_all(&buf[..n]).map_err(io_out)?;
                 offset += n as u64;
             }
         }
@@ -161,7 +169,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut tx = vol.begin(&());
             let id = tx.create(None, tags, content).map_err(err)?;
             tx.commit().map_err(err)?;
-            println!("{id}");
+            say!("{id}");
         }
         "tag" => {
             let id = entity_id(arg(args, 2, "entity id")?)?;
@@ -183,7 +191,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut tx = vol.begin(&());
             let copy = tx.copy(&id, None, tags).map_err(err)?;
             tx.commit().map_err(err)?;
-            println!("{copy}");
+            say!("{copy}");
         }
         "rm" => {
             let mut vol = volume(path)?;
@@ -212,33 +220,30 @@ fn count(unit: &dyn Unit, query: &Query) -> Result<usize, String> {
     Ok(n)
 }
 
-fn print_image(image: &BlockUnit<FileDevice>) {
+fn print_image(image: &ImageUnit) -> Result<(), String> {
     let bs = tagfs::BLOCK_SIZE as u64;
-    println!("generation  {}", image.generation());
-    println!("size        {} bytes ({} blocks)", image.total_blocks() * bs, image.total_blocks());
-    println!("free        {} bytes", image.free_blocks() * bs);
+    say!("generation  {}", image.generation());
+    say!("size        {} bytes ({} blocks)", image.total_blocks() * bs, image.total_blocks());
+    say!("free        {} bytes", image.free_blocks() * bs);
+    Ok(())
 }
 
 fn info(path: &str) -> Result<(), String> {
     let has_path = Query::has("tagfs", tagfs_keys::HOSTFS_PATH);
     match open(path)? {
         Opened::Image(unit) => {
-            println!("kind        single-file unit");
-            println!("unit        {}", hex(&unit.id().0));
-            println!("entities    {}", count(&unit, &Query::All)?);
-            print_image(&unit);
+            say!("kind        single-file unit");
+            say!("unit        {}", hex(&unit.id().0));
+            say!("entities    {}", count(&unit, &Query::All)?);
+            print_image(&unit)?;
         }
         Opened::Dir(unit) => {
-            println!("kind        directory unit");
-            println!("root        {}", unit.root().display());
-            println!("unit        {}", hex(&unit.id().0));
-            println!(
-                "entities    {} ({} files in the directory)",
-                count(&unit, &Query::All)?,
-                count(&unit, &has_path)?
-            );
-            println!("live sync   {}", if unit.is_live() { "yes" } else { "no" });
-            print_image(&unit.image());
+            say!("kind        directory unit");
+            say!("root        {}", unit.root().display());
+            say!("unit        {}", hex(&unit.id().0));
+            say!("entities    {} ({} files in the directory)", count(&unit, &Query::All)?, count(&unit, &has_path)?);
+            say!("live sync   {}", if unit.is_live() { "yes" } else { "no" });
+            print_image(&unit.image())?;
         }
     }
     Ok(())
@@ -249,13 +254,16 @@ fn check(path: &str) -> Result<(), String> {
         Opened::Image(unit) => unit.verify().map_err(err)?,
         Opened::Dir(mut unit) => {
             let report = unit.rescan().map_err(err)?;
-            println!(
+            say!(
                 "reconciled: {} added, {} removed, {} renamed, {} skipped",
-                report.added, report.removed, report.renamed, report.skipped
+                report.added,
+                report.removed,
+                report.renamed,
+                report.skipped
             );
             unit.image().verify().map_err(err)?;
         }
     }
-    println!("ok");
+    say!("ok");
     Ok(())
 }

@@ -155,10 +155,21 @@ name = "tagfs"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "tagfs-backend-file",
  "tagfs-backend-hostdir",
  "tagfs-block",
  "tagfs-core",
  "tagfs-device",
+ "tagfs-device-host",
+]
+
+[[package]]
+name = "tagfs-backend-file"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "tagfs-block",
+ "tagfs-core",
  "tagfs-device-host",
 ]
 
@@ -169,9 +180,9 @@ dependencies = [
  "file-id",
  "getrandom",
  "notify",
+ "tagfs-backend-file",
  "tagfs-block",
  "tagfs-core",
- "tagfs-device-host",
 ]
 
 [[package]]

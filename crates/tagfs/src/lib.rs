@@ -5,7 +5,7 @@
 //! ```no_run
 //! use tagfs::{Query, Tag, Unrestricted, Volume};
 //!
-//! let unit = tagfs::create_image("/tmp/demo.img", tagfs::new_unit_id()).unwrap();
+//! let unit = tagfs::image::create("/tmp/demo.img", tagfs::new_unit_id()).unwrap();
 //! let mut vol = Volume::new(Unrestricted, Box::new(tagfs::SystemIds));
 //! vol.attach(Box::new(unit)).unwrap();
 //!
@@ -17,14 +17,17 @@
 //!
 //! 存储单元的种类：
 //!
-//! - 单文件（镜像文件）：[`create_image`]、[`open_image`]。放在宿主能访问的任何地方，按需扩容。
+//! - 单文件（镜像文件）：[`image`]（单文件后端）。放在宿主能访问的任何地方，按需扩容。
 //! - 裸盘：[`open_disk`]，先用 [`format_disk`] 格式化。
-//! - 目录：[`DirUnit`]，把宿主目录里按路径组织的文件映射成实体。
+//! - 宿主目录：[`DirUnit`]（宿主目录后端，路径目录兼容层），把宿主目录里按路径组织的文件映射成实体。
 //! - 内存：[`memory_unit`]，测试和临时卷用。
 
 use std::io;
 use std::path::Path;
 
+/// 单文件后端。
+pub use tagfs_backend_file as image;
+pub use tagfs_backend_file::{ImageError, ImageUnit};
 pub use tagfs_backend_hostdir::{DirError, DirUnit, HostPath, ScanReport};
 pub use tagfs_block::{BlockUnit, OpenError};
 pub use tagfs_core::tag::tagfs_keys;
@@ -36,9 +39,7 @@ pub use tagfs_device::{BlockDevice, DeviceError, MemDevice};
 pub use tagfs_device_host::FileDevice;
 
 /// 块大小。
-pub const BLOCK_SIZE: u32 = 4096;
-/// 新建镜像文件的初始容量；不够时自动扩容。
-const INITIAL_IMAGE: u64 = 4 << 20;
+pub const BLOCK_SIZE: u32 = tagfs_backend_file::BLOCK_SIZE;
 
 /// 打开或新建存储单元时的错误。
 #[derive(Debug)]
@@ -46,6 +47,15 @@ pub enum UnitOpenError {
     Io(io::Error),
     Block(OpenError),
     Dir(DirError),
+}
+
+impl From<ImageError> for UnitOpenError {
+    fn from(e: ImageError) -> Self {
+        match e {
+            ImageError::Io(e) => UnitOpenError::Io(e),
+            ImageError::Format(e) => UnitOpenError::Block(e),
+        }
+    }
 }
 
 impl From<io::Error> for UnitOpenError {
@@ -98,17 +108,6 @@ pub fn new_unit_id() -> UnitId {
     UnitId(b)
 }
 
-/// 在 `path` 新建一个单文件单元（覆盖已有文件）。
-pub fn create_image(path: impl AsRef<Path>, unit: UnitId) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
-    let dev = FileDevice::create(path, INITIAL_IMAGE, BLOCK_SIZE)?;
-    Ok(BlockUnit::format(dev, unit)?)
-}
-
-/// 打开单文件单元。
-pub fn open_image(path: impl AsRef<Path>) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
-    Ok(BlockUnit::open(FileDevice::open(path, BLOCK_SIZE, false)?)?)
-}
-
 /// 格式化裸盘（整块盘或分区），原有内容全部丢失。
 pub fn format_disk(path: impl AsRef<Path>, unit: UnitId) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
     Ok(BlockUnit::format(FileDevice::open(path, BLOCK_SIZE, false)?, unit)?)
@@ -116,7 +115,7 @@ pub fn format_disk(path: impl AsRef<Path>, unit: UnitId) -> Result<BlockUnit<Fil
 
 /// 打开裸盘上的单元。
 pub fn open_disk(path: impl AsRef<Path>) -> Result<BlockUnit<FileDevice>, UnitOpenError> {
-    open_image(path)
+    Ok(BlockUnit::open(FileDevice::open(path, BLOCK_SIZE, false)?)?)
 }
 
 /// 内存单元，最大 `max_bytes` 字节，按需增长。
@@ -132,7 +131,7 @@ pub fn open_unit(path: impl AsRef<Path>) -> Result<Box<dyn Unit>, UnitOpenError>
         let (unit, _) = DirUnit::open(path, Box::new(SystemIds))?;
         Ok(Box::new(unit))
     } else {
-        Ok(Box::new(open_image(path)?))
+        Ok(Box::new(image::open(path)?))
     }
 }
 
@@ -205,7 +204,7 @@ mod tests {
     #[test]
     fn an_image_unit_round_trips_through_reopening() {
         let path = std::env::temp_dir().join(format!("tagfs-facade-{}.img", std::process::id()));
-        let unit = create_image(&path, new_unit_id()).unwrap();
+        let unit = image::create(&path, new_unit_id()).unwrap();
         let mut v = volume_with(Box::new(unit));
         let mut tx = v.begin(&());
         let id = tx.create(None, vec![Tag::new("user", "name", "a")], vec![5; 10_000]).unwrap();

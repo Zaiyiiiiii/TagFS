@@ -30,13 +30,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use tagfs_block::{Aux, Batch, BlockUnit, Fill, OpenError, Source};
+use tagfs_backend_file::{ImageError, ImageUnit};
+use tagfs_block::{Aux, Batch, Fill, OpenError, Source};
 use tagfs_core::tag::tagfs_keys::HOSTFS_PATH;
 use tagfs_core::{
     Change, EntityId, EntityRecord, IdSource, Key, Namespace, Probe, Snapshot, Tag, TxnId, TxnInfo, Unit, UnitError,
     UnitId, Value,
 };
-use tagfs_device_host::FileDevice;
 
 pub use path::{HostPath, RESERVED};
 
@@ -46,9 +46,6 @@ const TMP: &str = "tmp";
 const EDITED: &str = "edited";
 /// 第 2 步里“让出旧文件”已经做完的标记。
 const PARKED: &str = "parked";
-const BLOCK_SIZE: u32 = 4096;
-/// 镜像文件的初始容量；不够时自动扩容。
-const INITIAL_IMAGE: u64 = 4 << 20;
 /// 流式搬运内容时一次读写多少。
 const CHUNK: usize = 1 << 20;
 
@@ -74,9 +71,12 @@ impl From<io::Error> for DirError {
     }
 }
 
-impl From<OpenError> for DirError {
-    fn from(e: OpenError) -> Self {
-        DirError::Open(e)
+impl From<ImageError> for DirError {
+    fn from(e: ImageError) -> Self {
+        match e {
+            ImageError::Io(e) => DirError::Io(e.kind()),
+            ImageError::Format(e) => DirError::Open(e),
+        }
     }
 }
 
@@ -494,7 +494,7 @@ type Scope = Vec<String>;
 
 struct Inner {
     root: PathBuf,
-    image: BlockUnit<FileDevice>,
+    image: ImageUnit,
     ids: Box<dyn IdSource>,
 }
 
@@ -529,8 +529,7 @@ impl DirUnit {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(DirError::AlreadyExists),
             Err(e) => return Err(e.into()),
         }
-        let dev = FileDevice::create(own.join(IMAGE), INITIAL_IMAGE, BLOCK_SIZE)?;
-        let image = BlockUnit::format(dev, unit)?;
+        let image = tagfs_backend_file::create(own.join(IMAGE), unit)?;
         Self::start(root, image, ids)
     }
 
@@ -541,15 +540,11 @@ impl DirUnit {
         if !img.is_file() {
             return Err(DirError::NotFound);
         }
-        let image = BlockUnit::open(FileDevice::open(img, BLOCK_SIZE, false)?)?;
+        let image = tagfs_backend_file::open(img)?;
         Self::start(root, image, ids)
     }
 
-    fn start(
-        root: PathBuf,
-        image: BlockUnit<FileDevice>,
-        ids: Box<dyn IdSource>,
-    ) -> Result<(Self, ScanReport), DirError> {
+    fn start(root: PathBuf, image: ImageUnit, ids: Box<dyn IdSource>) -> Result<(Self, ScanReport), DirError> {
         // 先开始监听，再对账：对账期间发生的改动不会漏掉。
         let watch = start_watch(&root);
         let mut inner = Inner { root: root.clone(), image, ids };
@@ -574,7 +569,7 @@ impl DirUnit {
     }
 
     /// 镜像（块格式单元），检查用。
-    pub fn image(&self) -> Ref<'_, BlockUnit<FileDevice>> {
+    pub fn image(&self) -> Ref<'_, ImageUnit> {
         Ref::map(self.inner.borrow(), |i| &i.image)
     }
 

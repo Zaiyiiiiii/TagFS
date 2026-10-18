@@ -320,9 +320,10 @@ Cargo workspace：
 | `tagfs-block` | 块格式单元：写时复制 B+ 树、分配器、事务、回收 | `no_std` + `alloc`、`tagfs-core`、`tagfs-device` |
 | `tagfs-device` | `BlockDevice` 接口、内存实现 | `no_std` + `alloc` |
 | `tagfs-device-host` | 宿主机单文件、各平台裸盘 | `std` |
-| `tagfs-backend-hostdir` | 宿主目录后端（路径目录兼容层），自带工具 `tagfs-hostdir`：在宿主目录上建目录单元、全量对账 | `std`、`tagfs-core`、`tagfs-block`（镜像文件） |
+| `tagfs-backend-file` | 单文件后端：块格式单元存在一个镜像文件里，按需扩容；自带工具 `tagfs-file`：新建镜像文件 | `std`、`tagfs-block`、`tagfs-device-host` |
+| `tagfs-backend-hostdir` | 宿主目录后端（路径目录兼容层），自带工具 `tagfs-hostdir`：在宿主目录上建目录单元、全量对账 | `std`、`tagfs-core`、`tagfs-backend-file`（存放没有路径的实体的镜像文件） |
 | `tagfs` | 对外 API，组合以上各层：按路径打开或新建各种单元、系统时钟和随机数的身份来源、查询游标 | 以上全部 |
-| `tagfs-tools` | 命令行工具 `tagfs`：建单元、一致性检查、单元信息、列出和查询实体、读写内容和 Tag | `std` |
+| `tagfs-tools` | 通用命令行工具 `tagfs`：对任何单元做一致性检查、查看信息、查找实体、读写内容和 Tag。建单元由各后端自己的工具负责 | `std` |
 
 核心三个 crate 不依赖 `std`，将来脱离宿主运行在裸机上时，只需要换设备实现。
 

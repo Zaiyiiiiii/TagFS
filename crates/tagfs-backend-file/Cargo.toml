@@ -1,0 +1,19 @@
+[package]
+name = "tagfs-backend-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的单文件后端：块格式单元存在一个镜像文件里，文件放在宿主能访问的任何地方，按需扩容"
+
+[[bin]]
+name = "tagfs-file"
+path = "src/bin/tagfs-file.rs"
+
+[dependencies]
+getrandom = "0.3"
+tagfs-block = { path = "../tagfs-block" }
+tagfs-core = { path = "../tagfs-core" }
+tagfs-device-host = { path = "../tagfs-device-host" }
+
+[lints]
+workspace = true

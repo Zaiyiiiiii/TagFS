@@ -13,9 +13,9 @@ path = "src/bin/tagfs-hostdir.rs"
 file-id = "0.2"
 getrandom = "0.3"
 notify = "8"
+tagfs-backend-file = { path = "../tagfs-backend-file" }
 tagfs-block = { path = "../tagfs-block" }
 tagfs-core = { path = "../tagfs-core" }
-tagfs-device-host = { path = "../tagfs-device-host" }
 
 [lints]
 workspace = true
