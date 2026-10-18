@@ -137,8 +137,8 @@ fn namespace_write_rules_default_to_deny() {
     assert_eq!(tx.add_tag(&a, Tag::new("tagfs", "txn_pending", "x")), Err(Error::NotWritable));
     assert_eq!(tx.create(None, vec![Tag::flag("tagfs", "anything")], vec![]), Err(Error::NotWritable));
     assert!(tx.add_tag(&a, name("fine")).is_ok());
-    assert_eq!(tx.add_tag(&a, name(&"x".repeat(256))), Err(Error::TagTooLong));
-    assert!(tx.add_tag(&a, name(&"x".repeat(255))).is_ok());
+    assert_eq!(tx.add_tag(&a, name(&"x".repeat(4097))), Err(Error::TagTooLong));
+    assert!(tx.add_tag(&a, name(&"x".repeat(4096))).is_ok());
 }
 
 #[test]

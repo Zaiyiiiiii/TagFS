@@ -130,8 +130,8 @@ impl fmt::Debug for Tag {
 pub const MAX_NAMESPACE_LEN: usize = 64;
 /// 键的最大长度（字节）。
 pub const MAX_KEY_LEN: usize = 64;
-/// 字符串值的最大长度（字节）。
-pub const MAX_STR_LEN: usize = 255;
+/// 字符串值的最大长度（字节），和 Linux 的 `PATH_MAX` 一样。
+pub const MAX_STR_LEN: usize = 4096;
 
 impl Tag {
     /// 长度是否在限制之内。存储单元要把 Tag 放进索引键，键的长度必须有上限。

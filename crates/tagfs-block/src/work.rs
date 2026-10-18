@@ -13,11 +13,13 @@ use tagfs_device::BlockDevice;
 use crate::codec::put_u64;
 use crate::extent::ExtentSet;
 use crate::keys;
-use crate::tree::{Tree, max_entry};
+use crate::tree::Tree;
 use crate::view::{INLINE_MAX, Object, View, encode_prepared};
 
 /// 一次复制对象内容时最多搬多少块。
 const COPY_CHUNK_BLOCKS: u64 = 64;
+/// 准备记录切成这么大的片存进树里，每片一个条目。
+const PREPARED_CHUNK: usize = 1024;
 
 pub(crate) struct Work<D: BlockDevice> {
     pub(crate) dev: Rc<RefCell<D>>,
@@ -361,16 +363,10 @@ impl<D: BlockDevice> Work<D> {
 
     // ---- 事务记录 ----
 
-    fn chunk_size(&self) -> usize {
-        // 键是 1 + 16 + 4 字节。
-        (max_entry(self.bs as usize) - 21).min(1024)
-    }
-
     pub(crate) fn put_prepared(&mut self, info: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
         self.remove_prepared(&info.id)?;
         let payload = encode_prepared(info, changes);
-        let chunk = self.chunk_size();
-        for (i, part) in payload.chunks(chunk).enumerate() {
+        for (i, part) in payload.chunks(PREPARED_CHUNK).enumerate() {
             self.put(keys::prepared_chunk(&info.id, i as u32), part.to_vec())?;
         }
         Ok(())

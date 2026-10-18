@@ -226,6 +226,39 @@ fn behaves_like_the_reference_unit() {
 }
 
 #[test]
+fn tags_up_to_the_length_limit_work() {
+    let mut block = fresh(2048);
+    let mut reference = MemUnit::new(UNIT);
+    // 最坏情况：全是 NUL，转义后翻倍。
+    let longest = |c: char| Tag::new("user", "path", c.to_string().repeat(tagfs_core::tag::MAX_STR_LEN));
+    let mut changes = Vec::new();
+    for i in 0..60u64 {
+        let c = ['\0', 'a', 'b'][i as usize % 3];
+        let mut tag = longest(c);
+        if let Value::Str(s) = &mut tag.value {
+            s.truncate(s.len() - i as usize);
+        }
+        changes.push(Change::Create { id: eid(i), tags: vec![tag, Tag::new("user", "n", i)], content: vec![] });
+    }
+    for unit in [&mut block as &mut dyn Unit, &mut reference] {
+        unit.apply(&changes).unwrap();
+        unit.apply(&[Change::Delete { id: eid(7) }, Change::RemoveTag { id: eid(8), tag: longest('\0') }]).unwrap();
+    }
+    block.verify().unwrap();
+    let reopened = BlockUnit::open(block.device().crash(usize::MAX)).unwrap();
+    reopened.verify().unwrap();
+    assert_eq!(dump(&*reopened.snapshot()), dump(&*reference.snapshot()));
+    let (ns, key) = (Namespace::new("user"), Key::new("path"));
+    for p in [
+        Probe::Prefix { ns: &ns, key: &key, prefix: "aaa" },
+        Probe::Has { ns: &ns, key: &key },
+        Probe::Range { ns: &ns, key: &key, lower: &Bound::Excluded(Value::str("a")), upper: &Bound::Unbounded },
+    ] {
+        assert_eq!(reopened.snapshot().probe(&p).unwrap(), reference.snapshot().probe(&p).unwrap());
+    }
+}
+
+#[test]
 fn deleting_everything_gives_all_space_back() {
     let mut unit = fresh(512);
     let empty = unit.free_blocks();

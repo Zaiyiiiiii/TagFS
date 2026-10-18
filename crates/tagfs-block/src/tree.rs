@@ -4,16 +4,21 @@
 //! [`Tree::replaced`]，提交时再把内存里的节点自底向上写到新分配的块。读者拿着旧的根，
 //! 看到的始终是旧的那棵树。
 //!
-//! 节点块的布局：
+//! 节点通常占一个块。单个条目本身就超过一块时（例如很长的 Tag），它独占一个节点，
+//! 这个节点跨多个块存放；这些块不必连续，第一块里记着其余块的位置。节点的布局（多块时
+//! 按块的顺序拼起来看）：
 //!
 //! | 偏移 | 长度 | 内容 |
 //! |---|---|---|
-//! | 0 | 4 | CRC-32C，覆盖 4 到块尾 |
+//! | 0 | 4 | CRC-32C，覆盖 4 到节点末尾 |
 //! | 4 | 1 | 种类：1 叶子，2 分支 |
 //! | 5 | 1 | 保留 |
 //! | 6 | 2 | 条目数 |
 //! | 8 | 8 | 写入时的提交号 |
-//! | 16 | … | 条目 |
+//! | 16 | 2 | 额外块数 e |
+//! | 18 | 2 | 保留 |
+//! | 20 | 8e | 额外块的块号 |
+//! | 20+8e | … | 条目 |
 //!
 //! 叶子条目：键长 u16、值长 u16、键、值。分支条目：键长 u16、子节点块号 u64、键；
 //! 键是子树里所有键的下界，第一个子树的键不起作用。
@@ -30,7 +35,7 @@ use tagfs_device::BlockDevice;
 use crate::codec::{Reader, put_u16, put_u64};
 use crate::crc::crc32c;
 
-const HEADER: usize = 16;
+const HEADER: usize = 20;
 const KIND_LEAF: u8 = 1;
 const KIND_BRANCH: u8 = 2;
 
@@ -57,17 +62,33 @@ impl Node {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    fn len(&self) -> usize {
         match self {
-            Node::Leaf(es) => es.is_empty(),
-            Node::Branch(cs) => cs.is_empty(),
+            Node::Leaf(es) => es.len(),
+            Node::Branch(cs) => cs.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 各条目编码后的字节数，按顺序。
+    fn entry_sizes(&self) -> Vec<usize> {
+        match self {
+            Node::Leaf(es) => es.iter().map(|(k, v)| 4 + k.len() + v.len()).collect(),
+            Node::Branch(cs) => cs.iter().map(|(k, _)| 10 + k.len()).collect(),
         }
     }
 }
 
-/// 一个条目（键加值）的最大字节数。节点分裂后两半都放得下的前提是单个条目不超过容量的三分之一。
-pub(crate) fn max_entry(block_size: usize) -> usize {
-    (block_size - HEADER) / 3 - 4
+/// 正文为 `body` 字节的节点要占几个块（额外块的块号也要占地方）。
+fn blocks_for(body: usize, bs: usize) -> usize {
+    let mut k = 1;
+    while HEADER + 8 * (k - 1) + body > k * bs {
+        k += 1;
+    }
+    k
 }
 
 pub(crate) fn read_block<D: BlockDevice + ?Sized>(dev: &D, block: u64, bs: usize) -> Result<Vec<u8>, UnitError> {
@@ -76,14 +97,32 @@ pub(crate) fn read_block<D: BlockDevice + ?Sized>(dev: &D, block: u64, bs: usize
     Ok(buf)
 }
 
-fn decode(buf: &[u8]) -> Result<Node, UnitError> {
+/// 读一个节点，返回节点和它占用的全部块（第一个是它自己的块号）。
+fn read_node<D: BlockDevice + ?Sized>(dev: &D, block: u64, bs: usize) -> Result<(Node, Vec<u64>), UnitError> {
+    let mut buf = read_block(dev, block, bs)?;
+    let extra = u16::from_le_bytes(buf[16..18].try_into().unwrap()) as usize;
+    if HEADER + 8 * extra > bs {
+        return Err(UnitError::Corrupt);
+    }
+    let mut blocks = vec![block];
+    for i in 0..extra {
+        let at = HEADER + 8 * i;
+        blocks.push(u64::from_le_bytes(buf[at..at + 8].try_into().unwrap()));
+    }
+    for &b in &blocks[1..] {
+        buf.extend_from_slice(&read_block(dev, b, bs)?);
+    }
+    Ok((decode(&buf, extra)?, blocks))
+}
+
+fn decode(buf: &[u8], extra: usize) -> Result<Node, UnitError> {
     let crc = u32::from_le_bytes(buf[..4].try_into().unwrap());
     if crc != crc32c(&buf[4..]) {
         return Err(UnitError::Corrupt);
     }
     let kind = buf[4];
     let count = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
-    let mut r = Reader::new(&buf[HEADER..]);
+    let mut r = Reader::new(&buf[HEADER + 8 * extra..]);
     match kind {
         KIND_LEAF => {
             let mut es = Vec::with_capacity(count);
@@ -107,18 +146,20 @@ fn decode(buf: &[u8]) -> Result<Node, UnitError> {
     }
 }
 
-fn encode(node: &Node, generation: u64, bs: usize) -> Vec<u8> {
+/// 编码成 `blocks.len()` 个块那么长的字节串；`blocks` 是节点要写入的块，第一个是它自己。
+fn encode(node: &Node, generation: u64, blocks: &[u64], bs: usize) -> Vec<u8> {
     let mut out = vec![0u8; 8];
     out[4] = match node {
         Node::Leaf(_) => KIND_LEAF,
         Node::Branch(_) => KIND_BRANCH,
     };
-    let count = match node {
-        Node::Leaf(es) => es.len(),
-        Node::Branch(cs) => cs.len(),
-    };
-    out[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&(node.len() as u16).to_le_bytes());
     put_u64(&mut out, generation);
+    put_u16(&mut out, (blocks.len() - 1) as u16);
+    put_u16(&mut out, 0);
+    for &b in &blocks[1..] {
+        put_u64(&mut out, b);
+    }
     match node {
         Node::Leaf(es) => {
             for (k, v) in es {
@@ -137,11 +178,29 @@ fn encode(node: &Node, generation: u64, bs: usize) -> Vec<u8> {
             }
         }
     }
-    assert!(out.len() <= bs, "node overflows its block");
-    out.resize(bs, 0);
+    assert!(out.len() <= blocks.len() * bs, "node overflows its blocks");
+    out.resize(blocks.len() * bs, 0);
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
     out
+}
+
+/// 第一个使左半不小于一半的位置，限制在 `1..len` 内。
+fn half(sizes: &[usize]) -> usize {
+    let total: usize = sizes.iter().sum();
+    let mut acc = 0;
+    let at = sizes.iter().position(|s| {
+        acc += s;
+        acc * 2 >= total
+    });
+    (at.unwrap_or(0) + 1).clamp(1, sizes.len() - 1)
+}
+
+/// 大于 `left`、不大于 `right` 的最短键（`right` 的一个前缀）。分支里只存它，键很长时分支也不会跟着变大。
+fn separator(left: &[u8], right: &[u8]) -> Vec<u8> {
+    debug_assert!(left < right);
+    let common = left.iter().zip(right).take_while(|(a, b)| a == b).count();
+    right[..common + 1].to_vec()
 }
 
 /// 分支里应当进入的子树：最后一个下界不大于 `key` 的。
@@ -165,7 +224,7 @@ impl Tree {
     fn load<D: BlockDevice + ?Sized>(&self, dev: &D, link: Link) -> Result<Cow<'_, Node>, UnitError> {
         match link {
             Link::Mem(i) => Ok(Cow::Borrowed(&self.arena[i])),
-            Link::Disk(b) => Ok(Cow::Owned(decode(&read_block(dev, b, self.bs)?)?)),
+            Link::Disk(b) => Ok(Cow::Owned(read_node(dev, b, self.bs)?.0)),
         }
     }
 
@@ -270,10 +329,15 @@ impl Tree {
         D: BlockDevice + ?Sized,
         F: FnMut(u64),
     {
-        if let Link::Disk(b) = link {
-            f(b);
-        }
-        if let Node::Branch(cs) = &*self.load(dev, link)? {
+        let node = match link {
+            Link::Mem(i) => Cow::Borrowed(&self.arena[i]),
+            Link::Disk(b) => {
+                let (node, blocks) = read_node(dev, b, self.bs)?;
+                blocks.into_iter().for_each(&mut *f);
+                Cow::Owned(node)
+            }
+        };
+        if let Node::Branch(cs) = &*node {
             for (_, child) in cs {
                 self.visit_rec(dev, *child, f)?;
             }
@@ -285,8 +349,8 @@ impl Tree {
         match link {
             Link::Mem(i) => Ok(i),
             Link::Disk(b) => {
-                let node = decode(&read_block(dev, b, self.bs)?)?;
-                self.replaced.push(b);
+                let (node, blocks) = read_node(dev, b, self.bs)?;
+                self.replaced.extend(blocks);
                 self.arena.push(node);
                 Ok(self.arena.len() - 1)
             }
@@ -299,19 +363,24 @@ impl Tree {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<(), UnitError> {
-        assert!(key.len() + value.len() <= max_entry(self.bs), "tree entry too large");
-        let root = match self.root {
+        assert!(key.len() <= u16::MAX as usize && value.len() <= u16::MAX as usize, "tree entry too large");
+        let mut root = match self.root {
             Some(link) => self.make_mem(dev, link)?,
             None => {
                 self.arena.push(Node::Leaf(Vec::new()));
                 self.arena.len() - 1
             }
         };
-        self.root = Some(Link::Mem(root));
-        if let Some((sep, right)) = self.insert_rec(dev, root, key, value)? {
-            self.arena.push(Node::Branch(vec![(Vec::new(), Link::Mem(root)), (sep, right)]));
-            self.root = Some(Link::Mem(self.arena.len() - 1));
+        let mut split = self.insert_rec(dev, root, key, value)?;
+        // 根分裂了就长高一层；新根本身也可能放不下，继续分。
+        while !split.is_empty() {
+            let mut children = vec![(Vec::new(), Link::Mem(root))];
+            children.extend(split);
+            self.arena.push(Node::Branch(children));
+            root = self.arena.len() - 1;
+            split = self.split_if_full(root);
         }
+        self.root = Some(Link::Mem(root));
         Ok(())
     }
 
@@ -321,7 +390,7 @@ impl Tree {
         idx: usize,
         key: Vec<u8>,
         value: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Link)>, UnitError> {
+    ) -> Result<Vec<(Vec<u8>, Link)>, UnitError> {
         match &mut self.arena[idx] {
             Node::Leaf(es) => match es.binary_search_by(|(k, _)| k.as_slice().cmp(&key)) {
                 Ok(i) => es[i].1 = value,
@@ -334,37 +403,68 @@ impl Tree {
                 let split = self.insert_rec(dev, ci, key, value)?;
                 let Node::Branch(cs) = &mut self.arena[idx] else { unreachable!() };
                 cs[i].1 = Link::Mem(ci);
-                if let Some(entry) = split {
-                    cs.insert(i + 1, entry);
+                for (j, entry) in split.into_iter().enumerate() {
+                    cs.insert(i + 1 + j, entry);
                 }
             }
         }
         Ok(self.split_if_full(idx))
     }
 
-    /// 节点超出一块时对半分开，右半成为新节点。返回右半的下界和链接。
-    fn split_if_full(&mut self, idx: usize) -> Option<(Vec<u8>, Link)> {
-        let node = &mut self.arena[idx];
-        let total = node.body_len();
-        if HEADER + total <= self.bs {
-            return None;
+    /// 节点超出一块时，从左到右尽量装满一块地切成几段，后面各段成为新节点。返回新节点的下界和链接。
+    ///
+    /// 叶子里单独就超过一块的条目自成一段（这样的节点跨多个块存放）。分支每段至少留两个孩子，
+    /// 否则分隔键很长时，根每长高一层还是同样多的长键，永远分不完。
+    fn split_if_full(&mut self, idx: usize) -> Vec<(Vec<u8>, Link)> {
+        let cap = self.bs - HEADER;
+        let node = &self.arena[idx];
+        let min = match node {
+            Node::Leaf(_) => 1,
+            Node::Branch(_) => 2,
+        };
+        if node.body_len() <= cap || node.len() < 2 * min {
+            return Vec::new();
         }
-        let right = match node {
-            Node::Leaf(es) => {
-                let m = split_point(es.iter().map(|(k, v)| 4 + k.len() + v.len()), total);
-                Node::Leaf(es.split_off(m))
+        let sizes = node.entry_sizes();
+        let mut starts = Vec::new();
+        if sizes.iter().all(|&s| s * 3 <= cap) {
+            // 常见情况：对半分。条目都不超过容量的三分之一，两半一定都放得下，
+            // 而且之后的插入不会立刻又把满的一半撑破。
+            starts.push(half(&sizes));
+        } else {
+            // 有大条目：从左到右尽量装满一块。
+            let (mut used, mut count) = (0, 0);
+            for (i, &s) in sizes.iter().enumerate() {
+                if count >= min && used + s > cap {
+                    starts.push(i);
+                    (used, count) = (0, 0);
+                }
+                used += s;
+                count += 1;
             }
-            Node::Branch(cs) => {
-                let m = split_point(cs.iter().map(|(k, _)| 10 + k.len()), total);
-                Node::Branch(cs.split_off(m))
+            if count < min {
+                starts.pop();
             }
-        };
-        let sep = match &right {
-            Node::Leaf(es) => es[0].0.clone(),
-            Node::Branch(cs) => cs[0].0.clone(),
-        };
-        self.arena.push(right);
-        Some((sep, Link::Mem(self.arena.len() - 1)))
+        }
+        let mut pieces = Vec::new();
+        for &at in starts.iter().rev() {
+            let (piece, sep) = match &mut self.arena[idx] {
+                Node::Leaf(es) => {
+                    let right = es.split_off(at);
+                    let sep = separator(&es[at - 1].0, &right[0].0);
+                    (Node::Leaf(right), sep)
+                }
+                Node::Branch(cs) => {
+                    let right = cs.split_off(at);
+                    let sep = right[0].0.clone();
+                    (Node::Branch(right), sep)
+                }
+            };
+            self.arena.push(piece);
+            pieces.push((sep, Link::Mem(self.arena.len() - 1)));
+        }
+        pieces.reverse();
+        pieces
     }
 
     /// 删除一个键，返回它是否存在。
@@ -442,26 +542,16 @@ impl Tree {
                 }
             }
         }
-        let block = alloc()?;
-        let buf = encode(&node, generation, self.bs);
-        dev.write_at(block * self.bs as u64, &buf).map_err(|_| UnitError::Device)?;
-        Ok(block)
-    }
-}
-
-/// 第一个使左半不小于一半的位置，限制在 `1..len` 内。
-fn split_point(sizes: impl Iterator<Item = usize>, total: usize) -> usize {
-    let sizes: Vec<usize> = sizes.collect();
-    let mut acc = 0;
-    let mut m = sizes.len() - 1;
-    for (i, s) in sizes.iter().enumerate() {
-        acc += s;
-        if acc * 2 >= total {
-            m = i + 1;
-            break;
+        let mut blocks = Vec::new();
+        for _ in 0..blocks_for(node.body_len(), self.bs) {
+            blocks.push(alloc()?);
         }
+        let buf = encode(&node, generation, &blocks, self.bs);
+        for (b, part) in blocks.iter().zip(buf.chunks(self.bs)) {
+            dev.write_at(b * self.bs as u64, part).map_err(|_| UnitError::Device)?;
+        }
+        Ok(blocks[0])
     }
-    m.clamp(1, sizes.len() - 1)
 }
 
 #[cfg(test)]
@@ -526,6 +616,42 @@ mod tests {
         }
         assert!(collect(&t, &dev).is_empty());
         assert_eq!(t.flush(&mut dev, &mut alloc, 9).unwrap(), None);
+    }
+
+    #[test]
+    fn entries_larger_than_a_block_get_their_own_nodes() {
+        let mut dev = MemDevice::new(4096 * 4096, BS as u32);
+        let mut next = 1u64;
+        // 故意隔一个块分配，确认多块节点不需要连续的块。
+        let mut alloc = || {
+            next += 2;
+            Ok(next)
+        };
+        let mut t = Tree::open(None, BS);
+        let mut model = BTreeMap::new();
+        for i in 0..400u32 {
+            let mut k = key(i);
+            if i % 3 == 0 {
+                k.extend(core::iter::repeat_n(0u8, 8000 + (i as usize % 700)));
+            }
+            let v = alloc::vec![(i % 7) as u8; if i % 5 == 0 { 9000 } else { 20 }];
+            t.insert(&dev, k.clone(), v.clone()).unwrap();
+            model.insert(k, v);
+            if i % 50 == 49 {
+                t.flush(&mut dev, &mut alloc, i as u64).unwrap();
+            }
+        }
+        for k in model.keys().step_by(4).cloned().collect::<Vec<_>>() {
+            assert!(t.remove(&dev, &k).unwrap());
+            model.remove(&k);
+        }
+        t.flush(&mut dev, &mut alloc, 999).unwrap();
+        let expect: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(collect(&t, &dev), expect);
+        let mut blocks = Vec::new();
+        t.visit_nodes(&dev, &mut |b| blocks.push(b)).unwrap();
+        let unique: alloc::collections::BTreeSet<_> = blocks.iter().collect();
+        assert_eq!(unique.len(), blocks.len());
     }
 
     #[test]
