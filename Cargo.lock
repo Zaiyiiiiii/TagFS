@@ -26,3 +26,12 @@ dependencies = [
  "tagfs-core",
  "tagfs-device",
 ]
+
+[[package]]
+name = "tagfs-dir"
+version = "0.1.0"
+dependencies = [
+ "tagfs-block",
+ "tagfs-core",
+ "tagfs-device-host",
+]

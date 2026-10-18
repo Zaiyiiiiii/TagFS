@@ -5,6 +5,7 @@ members = [
     "crates/tagfs-core",
     "crates/tagfs-device",
     "crates/tagfs-device-host",
+    "crates/tagfs-dir",
 ]
 
 [workspace.package]

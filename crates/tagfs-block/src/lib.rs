@@ -149,6 +149,9 @@ pub enum Aux {
     Delete(Vec<u8>),
 }
 
+/// 一条附加记录：键和值。
+pub type AuxRecord = (Vec<u8>, Vec<u8>);
+
 /// 一次提交的全部内容，见 [`BlockUnit::commit_batch`]。
 #[derive(Default)]
 pub struct Batch<'a> {
@@ -428,7 +431,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
     }
 
     /// 键以 `prefix` 开头的全部附加记录，按键排序。
-    pub fn aux_list(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, UnitError> {
+    pub fn aux_list(&self, prefix: &[u8]) -> Result<Vec<AuxRecord>, UnitError> {
         let tree = Tree::open(self.root(), self.bs);
         let mut out = Vec::new();
         tree.scan_prefix(&*self.dev.borrow(), &keys::aux(prefix), &mut |k, v| {
