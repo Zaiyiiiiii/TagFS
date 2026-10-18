@@ -250,13 +250,13 @@ TagFS 不做身份认证，它信任调用它的操作系统传来的上下文�
 pub trait BlockDevice {
     /// 设备的物理块大小；分配按它对齐
     fn block_size(&self) -> u32;
-    fn len(&self) -> u64;
+    fn capacity(&self) -> u64;
     /// 任意偏移、任意长度；对齐要求由实现自己消化
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError>;
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), DeviceError>;
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError>;
     /// 返回时，之前的写入已经持久化
-    fn flush(&self) -> Result<(), DeviceError>;
-    fn trim(&self, offset: u64, len: u64) -> Result<(), DeviceError>;
+    fn flush(&mut self) -> Result<(), DeviceError>;
+    fn trim(&mut self, offset: u64, len: u64) -> Result<(), DeviceError>;
 }
 ```
 

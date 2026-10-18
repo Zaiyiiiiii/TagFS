@@ -1,0 +1,9 @@
+[package]
+name = "tagfs-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的块设备接口与内存实现"
+
+[lints]
+workspace = true
