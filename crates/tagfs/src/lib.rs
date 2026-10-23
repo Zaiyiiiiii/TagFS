@@ -29,6 +29,8 @@
 //! - [`disk`]：裸盘后端。单元直接放在整块盘或分区上。
 //! - [`hostdir`]：宿主目录后端（路径目录兼容层），把宿主目录里按路径组织的文件映射成实体。
 //! - [`mem`]：内存后端，不持久化。
+//! - [`archive`]：zip 后端，把一个 zip 归档只读地挂成单元（软件包、离线分发的资料）。归档里没有单元编号，
+//!   由调用者给，所以不在 [`open_unit`] 认的范围里。
 
 use std::io;
 use std::path::Path;
@@ -41,6 +43,8 @@ pub use tagfs_backend_hostdir as hostdir;
 pub use tagfs_backend_hostdir::{DirError, DirUnit};
 pub use tagfs_backend_mem as mem;
 pub use tagfs_backend_mem::MemUnit;
+pub use tagfs_backend_zip as archive;
+pub use tagfs_backend_zip::{ZipError, ZipUnit};
 pub use tagfs_block::{BlockUnit, Hold, OpenError, Ticker};
 pub use tagfs_core::{
     Change, Entity, EntityId, EntityRecord, Error, IdSource, Key, Namespace, Policy, Probe, Query, Rules, Snapshot,
@@ -268,6 +272,36 @@ mod tests {
             assert!(matches!(open_unit(base.join(nothing)), Err(UnitOpenError::Unrecognized)), "{nothing}");
         }
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_zip_archive_is_a_read_only_unit() {
+        let path = std::env::temp_dir().join(format!("tagfs-facade-{}.zip", std::process::id()));
+        {
+            use std::io::Write;
+            let mut w = zip_writer(&path);
+            w.start_file("payload/web/main.js", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"console.log(1)").unwrap();
+            w.finish().unwrap();
+        }
+        let v = volume_with(Box::new(ZipUnit::open_file(UnitId([3; 16]), &path).unwrap()));
+        let q =
+            Query::Prefix { ns: Namespace::tagfs(), key: Key::new(archive::ARCHIVE_PATH), prefix: "/payload/".into() };
+        let ids = v.query(&(), &q).unwrap();
+        assert_eq!(ids.len(), 1);
+        let mut buf = [0u8; 64];
+        let n = v.read(&(), &ids[0], 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"console.log(1)");
+        // 卷照常拒绝改它。
+        let mut tx = v.begin(&());
+        assert!(tx.add_tag(&ids[0], Tag::new("user", "x", "y")).is_err() || tx.commit().is_err());
+        assert!(v.write(&(), &ids[0], 0, b"x").is_err());
+        drop(v);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn zip_writer(path: &Path) -> zip::ZipWriter<std::fs::File> {
+        zip::ZipWriter::new(std::fs::File::create(path).unwrap())
     }
 
     #[test]

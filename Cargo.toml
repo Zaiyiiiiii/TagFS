@@ -12,6 +12,7 @@ members = [
     "crates/tagfs-backend-file",
     "crates/tagfs-backend-mem",
     "crates/tagfs-backend-hostdir",
+    "crates/tagfs-backend-zip",
     "crates/tagfs-tools",
     "crates/tagfs-volume",
 ]

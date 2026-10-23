@@ -1,0 +1,14 @@
+[package]
+name = "tagfs-backend-zip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TagFS 的 zip 后端：把一个 zip 归档只读地挂成存储单元，条目映射成实体"
+
+[dependencies]
+tagfs-core = { path = "../tagfs-core" }
+tagfs-sync = { path = "../tagfs-sync", features = ["std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

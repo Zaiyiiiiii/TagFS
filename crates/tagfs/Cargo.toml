@@ -15,8 +15,12 @@ tagfs-backend-disk = { path = "../tagfs-backend-disk" }
 tagfs-backend-file = { path = "../tagfs-backend-file" }
 tagfs-backend-hostdir = { path = "../tagfs-backend-hostdir" }
 tagfs-backend-mem = { path = "../tagfs-backend-mem" }
+tagfs-backend-zip = { path = "../tagfs-backend-zip" }
 # 运行在宿主操作系统上：锁等待时让出线程。
 tagfs-sync = { path = "../tagfs-sync", features = ["std"] }
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

@@ -301,6 +301,14 @@ pub trait BlockDevice: Send + Sync {
 
 已知的不足：文件系统通知是异步送达的，宿主刚做的改动可能要过一小会儿才同步进来（路径实体的内容和长度始终是实时读宿主文件的，不受影响）；没有文件号、修改时间又相同的多个文件同时改名时认不出，当作删除加新建。
 
+**zip 后端**：软件包、离线分发的资料，交换格式就是 zip（压缩、通用、格式几十年不变，各种工具都能检查）。不必先解开成文件，挂上就是一个只读单元：
+
+- 每个文件条目是一个实体，带映射的 `tagfs:archive_path`，值是它在归档里的路径，规则同 `tagfs:hostfs_path`（以 `/` 开头，没有空段、`.`、`..`、反斜杠、NUL）；有一个条目不合法，整个归档就不挂。内容是解压后的条目。
+- 每个目录（归档里写明的，以及文件路径上隐含的）也是实体，带 `tagfs:archive_dir`，没有内容。条目记着修改时间时带 `tagfs:archive_mtime`（zip 的时间不带时区，按 UTC 算）。
+- 归档从任何能读、能定位的来源打开，不一定是宿主文件，也可以是另一个单元里的实体。归档里没有单元编号，由打开的人给；实体编号由单元编号和路径算出，同一个归档每次打开都一样。
+- 只读：元数据修改、内容写入、暂存都被拒绝，没有事务要恢复。压缩的条目不能从中间读，读时整个解压，最近读过的几个留在内存里。
+- 一致性检查就是把每个条目完整解压一遍，核对 CRC。
+
 错误码统一定义，不把宿主的 errno 带进核心。
 
 ## 7. API 层
@@ -362,6 +370,7 @@ Cargo workspace：
 | `tagfs-backend-file` | 单文件后端：块格式单元存在一个镜像文件里，按需扩容；自带工具 `tagfs-file`：新建镜像文件、加入卷 | `std`、`tagfs-block`、`tagfs-device-host` |
 | `tagfs-backend-disk` | 裸盘后端：块格式单元直接放在整块盘或分区上；自带工具 `tagfs-disk`：格式化、加入卷 | `std`、`tagfs-block`、`tagfs-device-host` |
 | `tagfs-backend-hostdir` | 宿主目录后端（路径目录兼容层），映射 `tagfs:hostfs_path`；自带工具 `tagfs-hostdir`：在宿主目录上建目录单元、加入卷 | `std`、`tagfs-core`、`tagfs-backend-file`（存放没有路径的实体的镜像文件） |
+| `tagfs-backend-zip` | zip 后端：把 zip 归档只读地挂成单元，映射 `tagfs:archive_path`、`tagfs:archive_dir`、`tagfs:archive_mtime` | `std`、`tagfs-core`、`zip` |
 | `tagfs` | 库的对外接口，组合以上各层：各后端、系统时钟和随机数的身份来源、查询游标 | 以上全部 |
 | `tagfs-proto` | 运行中的卷和各工具之间的协议：请求、应答、编码、客户端 | `std`、`tagfs-core` |
 | `tagfs-volume` | 运行中的卷（常驻进程） | `tagfs`、`tagfs-proto` |
