@@ -19,6 +19,9 @@
 //!
 //! 单元可以被多个线程同时使用：读不等写；互不相干的写各做各的。同一个实体的内容写入由调用者
 //! 排好先后（卷按实体加锁），单元不替调用者排。
+//!
+//! 有的单元还可以被多个进程同时打开（宿主上的镜像文件、宿主目录），没有服务进程，各进程直接读写，
+//! 由单元自己在进程之间协调；这时一个进程看到别的进程的内容写入要等对方提交（很快，见各后端）。
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -179,6 +182,9 @@ pub trait Unit: Send + Sync {
     fn prepare(&self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError>;
 
     /// 所有还没有了结的准备记录。卷在单元上线时据此恢复事务。
+    ///
+    /// 单元可以被多个进程同时打开时，别的进程正在进行的事务不在其中：它们由那个进程自己了结；
+    /// 那个进程不在了，才轮到别人。
     fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError>;
 
     /// 应用准备好的修改并删除准备记录，原子地完成。`as_primary` 时同时记下
@@ -188,7 +194,7 @@ pub trait Unit: Send + Sync {
     /// 丢弃准备记录，不应用修改。
     fn abort_prepared(&self, txn: TxnId) -> Result<(), UnitError>;
 
-    /// 作为主单元记下的、还没清掉的已提交事务。
+    /// 作为主单元记下的、还没清掉的已提交事务。和 [`Unit::prepared`] 一样不含别的进程正在进行的。
     fn committed(&self) -> Result<Vec<TxnInfo>, UnitError>;
 
     /// 清掉“已提交”记录。卷确认所有参与单元都完成后调用。

@@ -41,13 +41,13 @@ pub use tagfs_backend_hostdir as hostdir;
 pub use tagfs_backend_hostdir::{DirError, DirUnit};
 pub use tagfs_backend_mem as mem;
 pub use tagfs_backend_mem::MemUnit;
-pub use tagfs_block::{BlockUnit, OpenError};
+pub use tagfs_block::{BlockUnit, Hold, OpenError, Ticker};
 pub use tagfs_core::{
     Change, Entity, EntityId, EntityRecord, Error, IdSource, Key, Namespace, Policy, Probe, Query, Rules, Snapshot,
     Stage, StageId, Tag, Txn, TxnId, TxnInfo, Unit, UnitError, UnitId, Value, Volume,
 };
 pub use tagfs_device::{BlockDevice, DeviceError, MemDevice};
-pub use tagfs_device_host::FileDevice;
+pub use tagfs_device_host::{FileDevice, lock_dir};
 
 /// 块大小。
 pub const BLOCK_SIZE: u32 = tagfs_backend_file::BLOCK_SIZE;

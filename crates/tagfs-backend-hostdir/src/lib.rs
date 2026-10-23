@@ -2,10 +2,15 @@
 //! 那里按路径组织的文件。
 //!
 //! - 挂载目录就是根 `/`。其中的每个普通文件是一个实体，带 `tagfs:hostfs_path`，值是它以挂载目录为根的
-//!   路径；内容就是那个文件，读写都直接对文件进行（Tag 只负责找到文件）。目录不是实体。
+//!   路径；内容就是那个文件，读写都直接对文件进行（Tag 只负责找到文件）。
 //!   符号链接不映射，也不会被跟随。
 //! - `tagfs:hostfs_path` 是映射出来的：加上它就在宿主上建出文件（缺的上层目录一并建出），
 //!   改它就移动文件，去掉它或删除实体就删掉宿主文件。
+//! - 每个目录（挂载目录本身除外）也是一个实体，带 `tagfs:hostfs_dir`，没有内容。加上它就建出目录，
+//!   去掉它或删除实体就删掉目录（目录里还有别的东西时留着，下次对账再认回来）；改它等于在新路径建目录、
+//!   删旧路径的目录，目录里的文件要随同一批修改一起改路径才会跟过去。空目录因此也能由上层建出、保留。
+//! - `tagfs:hostfs_mtime` 是宿主上文件或目录的修改时间（自 1970 年起的纳秒），读的时候现取，不存；
+//!   写它就是改宿主上的修改时间。
 //! - 没有路径的实体存在挂载目录下的镜像文件里（`/.tagfs/unit.img`，块格式），和别的单元一样。
 //!   镜像文件同时存放全部实体的 Tag 和索引，以及目录单元自己的记录。镜像文件按需扩容。
 //! - 宿主上的改动（建、删、改名、改内容）通过文件系统通知实时同步过来；挂载时还会全量对账一次。
@@ -20,6 +25,10 @@
 //! 3. 镜像里再提交一次：删掉意图记录，记下文件身份。
 //!
 //! 之后断电，挂载时按意图记录把第 2、3 步做完：宿主操作都可以重做。
+//!
+//! 多个进程可以同时挂载同一个目录。元数据修改和对账在进程之间一次一个（`/.tagfs/meta.lock` 上的文件锁）；
+//! 拿到这把锁时如果还有意图记录，说明做这次修改的进程中途不在了，接着把它做完。内容读写不用这把锁。
+//! 每个进程各自监听宿主上的改动；同一个改动被几个进程先后对账，后来的看到的已经是对过的结果。
 //!
 //! 只有内容要换个地方存放时才会搬运整个文件：路径实体失去路径（内容进镜像）、从路径实体复制出没有路径的
 //! 实体，或者镜像里的实体加上路径（内容写到宿主）。这些都是分段流式进行的，不会整个读进内存。
@@ -48,7 +57,22 @@ pub use path::{HostPath, INVALID_PATH, PATH_TAKEN, RESERVED};
 /// 而是映射出来的：增、删、改它，就是在宿主上建立、删除、移动对应的文件。
 pub const HOSTFS_PATH: &str = "hostfs_path";
 
+/// 目录单元映射的 `tagfs` 键：这个实体代表宿主上的一个目录，值是它的路径（规则同 [`HOSTFS_PATH`]）。
+/// 这样的实体没有内容，也不能同时带 [`HOSTFS_PATH`]。
+pub const HOSTFS_DIR: &str = "hostfs_dir";
+
+/// 目录单元映射的 `tagfs` 键：宿主上文件或目录的修改时间，uint，自 1970 年起的纳秒。读实体时从宿主现取，
+/// 不存在镜像里，所以也不能按它查询；加上它（新值）就是改宿主上的修改时间，去掉它没有效果。
+pub const HOSTFS_MTIME: &str = "hostfs_mtime";
+
+/// 目录实体不能有内容。
+pub const NOT_A_FILE: UnitError = UnitError::Rejected("a directory has no content");
+/// 修改时间要是 uint。
+pub const INVALID_MTIME: UnitError = UnitError::Rejected("invalid modification time");
+
 const IMAGE: &str = "unit.img";
+/// 元数据修改和对账在进程之间的锁。
+const META_LOCK: &str = "meta.lock";
 const TMP: &str = "tmp";
 const STAGED: &str = "staged";
 /// 第 2 步里“宿主上的复制”已经做完的标记。
@@ -145,8 +169,97 @@ fn path_tag(p: &HostPath) -> Tag {
     Tag::new(Namespace::TAGFS, HOSTFS_PATH, p.value())
 }
 
+fn dir_key() -> (Namespace, Key) {
+    (Namespace::tagfs(), Key::new(HOSTFS_DIR))
+}
+
+/// 实体 Tag 里的目录路径。带了不止一个时报错。
+fn dir_of(tags: &[Tag]) -> Result<Option<HostPath>, UnitError> {
+    let (ns, key) = dir_key();
+    let mut found = None;
+    for t in tags.iter().filter(|t| t.is(&ns, &key)) {
+        let Value::Str(v) = &t.value else { return Err(INVALID_PATH) };
+        if found.replace(HostPath::parse(v)?).is_some() {
+            return Err(INVALID_PATH);
+        }
+    }
+    Ok(found)
+}
+
+fn dir_tag(p: &HostPath) -> Tag {
+    Tag::new(Namespace::TAGFS, HOSTFS_DIR, p.value())
+}
+
+fn is_mtime(t: &Tag) -> bool {
+    t.ns.is_tagfs() && t.key.as_str() == HOSTFS_MTIME
+}
+
+fn mtime_tag(ns: u64) -> Tag {
+    Tag::new(Namespace::TAGFS, HOSTFS_MTIME, ns)
+}
+
+fn mtime_of(m: &fs::Metadata) -> Option<u64> {
+    let d = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(d.as_nanos()).ok()
+}
+
+/// 要设的修改时间：实体、纳秒。
+type Times = Vec<(EntityId, u64)>;
+
+/// 修改时间不存进镜像：从一组修改里取出要设的修改时间，其余原样返回。
+fn split_times(changes: &[Change]) -> Result<(Vec<Change>, Times), UnitError> {
+    let mut times = Vec::new();
+    let mut take = |id: &EntityId, tags: &[Tag]| -> Result<Vec<Tag>, UnitError> {
+        let mut kept = Vec::new();
+        for t in tags {
+            if is_mtime(t) {
+                let Value::Uint(ns) = t.value else { return Err(INVALID_MTIME) };
+                times.push((*id, ns));
+            } else {
+                kept.push(t.clone());
+            }
+        }
+        Ok(kept)
+    };
+    let mut out = Vec::new();
+    for c in changes {
+        match c {
+            Change::AddTag { id, tag } if is_mtime(tag) => {
+                take(id, std::slice::from_ref(tag))?;
+            }
+            Change::RemoveTag { tag, .. } if is_mtime(tag) => {}
+            Change::Create { id, tags, content } => {
+                out.push(Change::Create { id: *id, tags: take(id, tags)?, content: *content });
+            }
+            Change::Copy { from, id, tags } => out.push(Change::Copy { from: *from, id: *id, tags: take(id, tags)? }),
+            other => out.push(other.clone()),
+        }
+    }
+    Ok((out, times))
+}
+
+/// 设宿主上文件或目录的修改时间。
+fn set_mtime(path: &Path, ns: u64) -> io::Result<()> {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns);
+    let mut open = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // 改时间只要 FILE_WRITE_ATTRIBUTES；目录要 FILE_FLAG_BACKUP_SEMANTICS 才打得开。
+        open.access_mode(0x100).custom_flags(0x0200_0000);
+    }
+    #[cfg(not(windows))]
+    open.read(true);
+    open.open(path)?.set_modified(at)
+}
+
 fn hex(id: &EntityId) -> String {
     id.0.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 文件落盘。要用能写的句柄：Windows 上只读句柄刷不了盘（`FlushFileBuffers` 要求写权限）。
+fn sync_file(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 fn sync_dir(dir: &Path) -> Result<(), UnitError> {
@@ -326,6 +439,10 @@ struct Intent {
     /// 宿主上的复制：新实体、源文件。在让出旧文件之前做。
     copies: Vec<(EntityId, HostPath)>,
     items: Vec<Item>,
+    /// 要建出的目录，最先做。
+    mkdirs: Vec<HostPath>,
+    /// 要删掉的目录，文件都放好之后最后做，深的先删；里面还有东西就留着。
+    rmdirs: Vec<HostPath>,
 }
 
 struct Enc(Vec<u8>);
@@ -392,7 +509,7 @@ impl<'a> Dec<'a> {
 
 impl Intent {
     fn is_empty(&self) -> bool {
-        self.copies.is_empty() && self.items.is_empty()
+        self.copies.is_empty() && self.items.is_empty() && self.mkdirs.is_empty() && self.rmdirs.is_empty()
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -419,6 +536,12 @@ impl Intent {
             }
             e.u8(it.vacate as u8);
         }
+        for dirs in [&self.mkdirs, &self.rmdirs] {
+            e.u64(dirs.len() as u64);
+            for d in dirs {
+                e.path(&Some(d.clone()));
+            }
+        }
         e.0
     }
 
@@ -442,6 +565,14 @@ impl Intent {
                 _ => return Err(UnitError::Corrupt),
             };
             intent.items.push(Item { id, old, new, place, vacate: d.u8()? != 0 });
+        }
+        // 早先的意图记录没有目录这两段。
+        if !d.0.is_empty() {
+            for dirs in [&mut intent.mkdirs, &mut intent.rmdirs] {
+                for _ in 0..d.u64()? {
+                    dirs.push(d.path()?.ok_or(UnitError::Corrupt)?);
+                }
+            }
         }
         Ok(intent)
     }
@@ -467,6 +598,18 @@ struct Plan {
 /// 需要对账的范围：挂载目录下的若干路径（按段），空表示整个目录。
 type Scope = Vec<String>;
 
+/// 持有元数据修改的锁，放掉时解锁。
+struct MetaGuard<'a> {
+    _local: tagfs_sync::MutexGuard<'a, ()>,
+    file: &'a fs::File,
+}
+
+impl Drop for MetaGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 struct Watch {
     // 只为持有：放掉它就停止监听。
     _watcher: notify::RecommendedWatcher,
@@ -477,8 +620,10 @@ pub struct DirUnit {
     root: PathBuf,
     image: ImageUnit,
     ids: Mutex<Box<dyn IdSource + Send>>,
-    /// 元数据修改和对账一次一个：它们都会搬动宿主上的文件。内容读写不用它。
+    /// 元数据修改和对账一次一个：它们都会搬动宿主上的文件。内容读写不用它。本进程里用这把锁排，
+    /// 进程之间用 `meta_file` 上的文件锁排，见 [`DirUnit::meta`]。
     meta: Mutex<()>,
+    meta_file: fs::File,
     watch: Option<Watch>,
     /// 取快照前同步失败的错误，下一个能报错的调用把它报出来。
     sync_error: Mutex<Option<UnitError>>,
@@ -519,6 +664,12 @@ impl DirUnit {
     }
 
     fn start(root: PathBuf, image: ImageUnit, ids: Box<dyn IdSource + Send>) -> Result<(Self, ScanReport), DirError> {
+        let meta_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(RESERVED).join(META_LOCK))?;
         // 先开始监听，再对账：对账期间发生的改动不会漏掉。
         let watch = start_watch(&root);
         let me = DirUnit {
@@ -526,19 +677,33 @@ impl DirUnit {
             image,
             ids: Mutex::new(ids),
             meta: Mutex::new(()),
+            meta_file,
             watch,
             sync_error: Mutex::new(None),
             dirty: Mutex::new(BTreeSet::new()),
         };
-        if let Some(raw) = me.image.aux_get(AUX_INTENT)? {
-            let intent = Intent::decode(&raw)?;
-            me.carry_out(&intent)?;
-            me.finish(&intent)?;
-        }
-        me.clean_tmp()?;
-        me.clean_staged()?;
-        let report = me.reconcile(None)?;
+        let report = {
+            let _one = me.meta()?;
+            me.clean_tmp()?;
+            me.clean_staged()?;
+            me.reconcile(None)?
+        };
         Ok((me, report))
+    }
+
+    /// 拿到元数据修改的锁（本进程里的和进程之间的）。镜像里还有意图记录，说明上一次修改做到一半就断了
+    /// （断电、进程崩溃，或者这个进程自己之前出错），先把它做完。
+    fn meta(&self) -> Result<MetaGuard<'_>, UnitError> {
+        let local = self.meta.lock();
+        self.meta_file.lock().map_err(io_err)?;
+        let guard = MetaGuard { _local: local, file: &self.meta_file };
+        if let Some(raw) = self.image.aux_get(AUX_INTENT)? {
+            let intent = Intent::decode(&raw)?;
+            self.carry_out(&intent)?;
+            self.finish(&intent)?;
+            self.clean_tmp()?;
+        }
+        Ok(guard)
     }
 
     pub fn root(&self) -> &Path {
@@ -558,7 +723,7 @@ impl DirUnit {
     /// 全量对账。
     pub fn rescan(&self) -> Result<ScanReport, UnitError> {
         self.drain_events();
-        let _one = self.meta.lock();
+        let _one = self.meta()?;
         self.reconcile(None)
     }
 
@@ -570,7 +735,7 @@ impl DirUnit {
         match self.drain_events() {
             None => Ok(ScanReport::default()),
             Some(scopes) => {
-                let _one = self.meta.lock();
+                let _one = self.meta()?;
                 self.reconcile(scopes.map(|s| s.into_iter().collect()))
             }
         }
@@ -643,8 +808,10 @@ impl DirUnit {
         }
     }
 
-    /// 镜像里已经没有对应暂存的暂存文件：上次没用上就断了，删掉。
+    /// 镜像里已经没有对应暂存的暂存文件：上次没用上就断了，删掉。拿住镜像的写者锁再看：别的进程刚建、
+    /// 还没提交的暂存，这时已经提交了，不会被当成没有。
     fn clean_staged(&self) -> Result<(), UnitError> {
+        let _hold = self.image.hold()?;
         let live: BTreeSet<String> = self.image.stages()?.iter().map(|s| s.0.to_string()).collect();
         let entries = match fs::read_dir(self.root.join(RESERVED).join(STAGED)) {
             Ok(e) => e,
@@ -669,8 +836,8 @@ impl DirUnit {
 
     /// 暂存文件落盘（准备记录或意图记录要引用它之前）。
     fn sync_staged_file(&self, s: StageId) -> Result<(), UnitError> {
-        match fs::File::open(self.staged_file(s)) {
-            Ok(f) => f.sync_all().map_err(io_err),
+        match sync_file(&self.staged_file(s)) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(UnitError::UnknownStage(s)),
             Err(e) => Err(io_err(e)),
         }
@@ -688,6 +855,10 @@ impl DirUnit {
     fn located(&self, id: &EntityId) -> Result<Option<HostPath>, UnitError> {
         self.refresh()?;
         let rec = self.image.snapshot().get(id)?.ok_or(UnitError::NotFound(*id))?;
+        // 目录实体没有内容，写不了。
+        if dir_of(&rec.tags)?.is_some() {
+            return Err(NOT_A_FILE);
+        }
         path_of(&rec.tags)
     }
 
@@ -719,10 +890,10 @@ impl DirUnit {
         })
     }
 
-    /// 范围内的宿主文件和镜像对账。`scopes` 为 `None` 时是整个目录。调用者持有 `meta`。
+    /// 范围内的宿主文件、目录和镜像对账。`scopes` 为 `None` 时是整个目录。调用者持有 `meta`。
     fn reconcile(&self, scopes: Option<BTreeSet<Scope>>) -> Result<ScanReport, UnitError> {
         let mut report = ScanReport::default();
-        let mut found: BTreeMap<HostPath, Ident> = BTreeMap::new();
+        let mut found = Found::default();
         match &scopes {
             None => walk(&self.root, &mut Vec::new(), &mut found, &mut report)?,
             Some(scopes) => {
@@ -750,7 +921,18 @@ impl DirUnit {
                 known.push((id, p));
             }
         }
+        let (dns, dkey) = dir_key();
+        let mut known_dirs: Vec<(EntityId, HostPath)> = Vec::new();
+        for id in snap.probe(&Probe::Has { ns: &dns, key: &dkey })?.unwrap_or_default() {
+            let rec = snap.get(&id)?.ok_or(UnitError::Corrupt)?;
+            if let Some(p) = dir_of(&rec.tags)?
+                && in_scope(&p)
+            {
+                known_dirs.push((id, p));
+            }
+        }
         drop(snap);
+        let Found { files: mut found, mut dirs } = found;
         let identities: BTreeMap<Vec<u8>, Ident> =
             self.image.aux_list(AUX_IDENTITY)?.into_iter().filter_map(|(k, v)| Some((k, Ident::decode(&v)?))).collect();
 
@@ -809,21 +991,29 @@ impl DirUnit {
             aux.push(Aux::Put(identity_key(&id), ident.encode()));
             report.added += 1;
         }
+        // 目录只按路径认：不见了就删掉实体，新出现的建实体。
+        for (id, p) in known_dirs {
+            if !dirs.remove(&p) {
+                changes.push(Change::Delete { id });
+                report.removed += 1;
+            }
+        }
+        for p in dirs {
+            let id = EntityId::generate(&mut **self.ids.lock());
+            changes.push(Change::Create { id, tags: vec![dir_tag(&p)], content: None });
+            report.added += 1;
+        }
         if !changes.is_empty() || !aux.is_empty() {
             self.image.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() })?;
         }
         Ok(report)
     }
 
-    /// 收集一个范围里的文件：范围是目录就整个走一遍，是文件就只看它。
-    fn collect_scope(
-        &self,
-        scope: &Scope,
-        found: &mut BTreeMap<HostPath, Ident>,
-        report: &mut ScanReport,
-    ) -> Result<(), UnitError> {
+    /// 收集一个范围里的文件和目录：范围是目录就连它自己整个走一遍，是文件就只看它。
+    fn collect_scope(&self, scope: &Scope, found: &mut Found, report: &mut ScanReport) -> Result<(), UnitError> {
         // 范围的上层任何一级是链接或不是目录，就没有可映射的东西。
         let mut host = self.root.clone();
+        let names: Vec<&std::ffi::OsStr> = scope.iter().map(|s| std::ffi::OsStr::new(s.as_str())).collect();
         for (i, seg) in scope.iter().enumerate() {
             host.push(seg);
             let Ok(m) = fs::symlink_metadata(&host) else { return Ok(()) };
@@ -832,10 +1022,9 @@ impl DirUnit {
             }
             let last = i + 1 == scope.len();
             if last && m.is_file() {
-                let names: Vec<&std::ffi::OsStr> = scope.iter().map(|s| std::ffi::OsStr::new(s.as_str())).collect();
                 match HostPath::from_names(&names) {
                     Some(p) => {
-                        found.insert(p, Ident::of(&host, &m));
+                        found.files.insert(p, Ident::of(&host, &m));
                     }
                     None => report.skipped += 1,
                 }
@@ -844,6 +1033,17 @@ impl DirUnit {
             if !m.is_dir() {
                 return Ok(());
             }
+        }
+        match HostPath::from_names(&names) {
+            Some(p) => {
+                found.dirs.insert(p);
+            }
+            // 名字映射不了的目录，里面的东西也映射不了。
+            None if !names.is_empty() => {
+                report.skipped += 1;
+                return Ok(());
+            }
+            None => {}
         }
         let mut names: Vec<std::ffi::OsString> = scope.iter().map(std::ffi::OsString::from).collect();
         walk(&host, &mut names, found, report)
@@ -854,6 +1054,7 @@ impl DirUnit {
         let snap = self.image.snapshot();
         // 涉及的实体：修改前的路径（只对修改前就存在的实体），以及按顺序模拟下来的 Tag（`None` 是已删除）。
         let mut before: BTreeMap<EntityId, Option<HostPath>> = BTreeMap::new();
+        let mut dir_before: BTreeMap<EntityId, Option<HostPath>> = BTreeMap::new();
         let mut after: BTreeMap<EntityId, Option<Vec<Tag>>> = BTreeMap::new();
         let mut copies: Vec<(usize, EntityId, EntityId)> = Vec::new();
         let mut created: Vec<(EntityId, StageId)> = Vec::new();
@@ -862,6 +1063,7 @@ impl DirUnit {
                 let tags = snap.get(id)?.map(|r| r.tags);
                 if let Some(t) = &tags {
                     before.insert(*id, path_of(t)?);
+                    dir_before.insert(*id, dir_of(t)?);
                 }
                 after.insert(*id, tags);
             }
@@ -904,10 +1106,22 @@ impl DirUnit {
         }
         drop(snap);
 
-        // 最后的状态：不存在为 None，存在时为它的路径。
+        // 最后的状态：不存在为 None，存在时为它的路径（文件的、目录的）。
         let mut finals: BTreeMap<EntityId, Option<Option<HostPath>>> = BTreeMap::new();
+        let mut dir_finals: BTreeMap<EntityId, Option<Option<HostPath>>> = BTreeMap::new();
         for (id, tags) in &after {
-            finals.insert(*id, tags.as_ref().map(|t| path_of(t)).transpose()?);
+            let file = tags.as_ref().map(|t| path_of(t)).transpose()?;
+            let dir = tags.as_ref().map(|t| dir_of(t)).transpose()?;
+            if matches!((&file, &dir), (Some(Some(_)), Some(Some(_)))) {
+                return Err(INVALID_PATH);
+            }
+            finals.insert(*id, file);
+            dir_finals.insert(*id, dir);
+        }
+        // 目录没有内容。
+        let is_dir = |id: &EntityId| matches!(dir_finals.get(id), Some(Some(Some(_))));
+        if created.iter().any(|(id, _)| is_dir(id)) || copies.iter().any(|(_, _, t)| is_dir(t)) {
+            return Err(NOT_A_FILE);
         }
         let on_host = |e: &EntityId| matches!(before.get(e), Some(Some(_)));
 
@@ -994,12 +1208,65 @@ impl DirUnit {
                 return Err(PATH_TAKEN);
             }
         }
+
+        // 目录：路径变了就在新路径建、删旧路径的。新路径不能和文件撞上，也不能已经是别的目录实体。
+        let snap = self.image.snapshot();
+        for (id, fin) in &dir_finals {
+            let old = dir_before.get(id).cloned().flatten();
+            let new = fin.clone().flatten();
+            if old == new {
+                continue;
+            }
+            if let Some(n) = new {
+                if targets.contains(&n) || intent.mkdirs.contains(&n) {
+                    return Err(PATH_TAKEN);
+                }
+                // 现在占着这个路径的目录实体，除非这一批里它被删掉、或者换了路径。
+                let holders = snap.probe(&Probe::Is(&dir_tag(&n)))?.unwrap_or_default();
+                let keeps = |h: &EntityId| match dir_finals.get(h) {
+                    None => true,
+                    Some(None) | Some(Some(None)) => false,
+                    Some(Some(Some(p))) => *p == n,
+                };
+                if holders.iter().any(keeps) {
+                    return Err(PATH_TAKEN);
+                }
+                if matches!(n.inspect(&self.root)?, Some(m) if !m.is_dir()) && !vacated.contains(&n) {
+                    return Err(PATH_TAKEN);
+                }
+                intent.mkdirs.push(n);
+            }
+            if let Some(o) = old {
+                intent.rmdirs.push(o);
+            }
+        }
+        drop(snap);
+        // 深的先删。
+        intent.rmdirs.sort_by_key(|p| std::cmp::Reverse(p.segments().len()));
         let stage_out = from_stage.into_values().collect();
         Ok(Plan { hydrate, copy_in, stage_in, stage_out, stage_done, intent })
     }
 
-    /// 第 1 步到第 3 步。`finish` 是同时了结的准备记录。调用者持有 `meta`。
+    /// 第 1 步到第 3 步，最后设修改时间。`finish` 是同时了结的准备记录。调用者持有 `meta`。
     fn run(&self, changes: &[Change], finish: Option<(TxnId, bool)>) -> Result<(), UnitError> {
+        let (changes, times) = split_times(changes)?;
+        self.place(&changes, finish)?;
+        if times.is_empty() {
+            return Ok(());
+        }
+        let snap = self.image.snapshot();
+        for (id, ns) in times {
+            let tags = snap.get(&id)?.ok_or(UnitError::NotFound(id))?.tags;
+            let Some(p) = path_of(&tags)?.or(dir_of(&tags)?) else { continue };
+            if p.inspect(&self.root)?.is_some() {
+                set_mtime(&p.on_host(&self.root), ns).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 第 1 步到第 3 步。
+    fn place(&self, changes: &[Change], finish: Option<(TxnId, bool)>) -> Result<(), UnitError> {
         let plan = self.plan(changes)?;
         // 要搬进镜像的内容先分段写进镜像里的暂存（这一步不挡别人读写），提交时一起生效。
         let mut ours = Vec::new();
@@ -1056,6 +1323,16 @@ impl DirUnit {
         fs::create_dir_all(&tmp).map_err(io_err)?;
         let staged = |id: &EntityId, ext: &str| tmp.join(format!("{}.{ext}", hex(id)));
 
+        // 建目录（含缺的上层）。
+        for d in &intent.mkdirs {
+            d.create_parents(&self.root)?;
+            match fs::create_dir(d.on_host(&self.root)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+
         // 宿主上的复制。
         if !tmp.join(COPIED).exists() {
             for (id, src) in &intent.copies {
@@ -1068,7 +1345,7 @@ impl DirUnit {
                         fs::File::create(&dest).map_err(io_err)?;
                     }
                 }
-                fs::File::open(&dest).and_then(|f| f.sync_all()).map_err(io_err)?;
+                sync_file(&dest).map_err(io_err)?;
             }
             fs::write(tmp.join(COPIED), b"").map_err(io_err)?;
             sync_dir(&tmp)?;
@@ -1125,10 +1402,19 @@ impl DirUnit {
         for d in dirs {
             sync_dir(&d)?;
         }
+
+        // 删目录，深的先删。里面还有东西（不映射的文件，或者这一批之外的）就留着，下次对账认回来。
+        for d in &intent.rmdirs {
+            if !matches!(d.inspect(&self.root), Ok(Some(m)) if m.is_dir()) {
+                continue;
+            }
+            let _ = fs::remove_dir(d.on_host(&self.root));
+        }
         Ok(())
     }
 
-    /// 第 3 步：从镜像写出的内容清出镜像（换成空的内容），记下文件身份，删掉意图记录。
+    /// 第 3 步：从镜像写出的内容清出镜像（换成空的内容），记下文件身份，删掉意图记录。放文件、建目录时顺带
+    /// 建出的上层目录，以及因为里面还有东西没删掉的目录，补上目录实体：宿主上的每个目录都有一个。
     fn finish(&self, intent: &Intent) -> Result<(), UnitError> {
         let mut adopt = Vec::new();
         let mut aux = vec![Aux::Delete(AUX_INTENT.to_vec())];
@@ -1147,7 +1433,23 @@ impl DirUnit {
                 _ => aux.push(Aux::Delete(identity_key(&id))),
             }
         }
-        self.image.commit_batch(&Batch { adopt: &adopt, aux: &aux, ..Batch::default() })
+        let mut dirs: BTreeSet<HostPath> = BTreeSet::new();
+        for p in intent.items.iter().filter_map(|it| it.new.as_ref()).chain(&intent.mkdirs) {
+            dirs.extend(p.ancestors());
+        }
+        dirs.extend(intent.rmdirs.iter().cloned());
+        let snap = self.image.snapshot();
+        let mut changes = Vec::new();
+        for d in dirs {
+            if matches!(d.inspect(&self.root)?, Some(m) if m.is_dir())
+                && snap.probe(&Probe::Is(&dir_tag(&d)))?.unwrap_or_default().is_empty()
+            {
+                let id = EntityId::generate(&mut **self.ids.lock());
+                changes.push(Change::Create { id, tags: vec![dir_tag(&d)], content: None });
+            }
+        }
+        drop(snap);
+        self.image.commit_batch(&Batch { adopt: &adopt, changes: &changes, aux: &aux, ..Batch::default() })
     }
 
     /// 准备记录里引用的暂存。
@@ -1178,11 +1480,18 @@ fn scope_of(root: &Path, p: &Path) -> Option<Scope> {
         .collect()
 }
 
-/// 走一遍 `dir`（挂载目录下 `names` 那一级），收集可映射的普通文件。不跟随符号链接。
+/// 对账时在宿主上找到的可映射的东西。
+#[derive(Default)]
+struct Found {
+    files: BTreeMap<HostPath, Ident>,
+    dirs: BTreeSet<HostPath>,
+}
+
+/// 走一遍 `dir`（挂载目录下 `names` 那一级），收集可映射的普通文件和目录。不跟随符号链接。
 fn walk(
     dir: &Path,
     names: &mut Vec<std::ffi::OsString>,
-    found: &mut BTreeMap<HostPath, Ident>,
+    found: &mut Found,
     report: &mut ScanReport,
 ) -> Result<(), UnitError> {
     let entries = match fs::read_dir(dir) {
@@ -1201,12 +1510,20 @@ fn walk(
         let Ok(ty) = entry.file_type() else { continue };
         names.push(name);
         if ty.is_dir() {
-            walk(&entry.path(), names, found, report)?;
+            let refs: Vec<&std::ffi::OsStr> = names.iter().map(|n| n.as_os_str()).collect();
+            match HostPath::from_names(&refs) {
+                Some(p) => {
+                    found.dirs.insert(p);
+                    walk(&entry.path(), names, found, report)?;
+                }
+                // 名字映射不了的目录，里面的东西也映射不了。
+                None => report.skipped += 1,
+            }
         } else if ty.is_file() {
             let refs: Vec<&std::ffi::OsStr> = names.iter().map(|n| n.as_os_str()).collect();
             match (HostPath::from_names(&refs), entry.metadata()) {
                 (Some(p), Ok(m)) => {
-                    found.insert(p, Ident::of(&entry.path(), &m));
+                    found.files.insert(p, Ident::of(&entry.path(), &m));
                 }
                 (None, _) => report.skipped += 1,
                 (Some(_), Err(_)) => {}
@@ -1225,7 +1542,7 @@ impl Unit for DirUnit {
     }
 
     fn mapped_keys(&self) -> &[&'static str] {
-        &[HOSTFS_PATH]
+        &[HOSTFS_PATH, HOSTFS_DIR, HOSTFS_MTIME]
     }
 
     fn snapshot(&self) -> Box<dyn Snapshot> {
@@ -1264,7 +1581,7 @@ impl Unit for DirUnit {
         let dirty = std::mem::take(&mut *self.dirty.lock());
         for p in dirty {
             if let Some(f) = self.host_file(&p)? {
-                fs::File::open(f).and_then(|f| f.sync_all()).map_err(io_err)?;
+                sync_file(&f).map_err(io_err)?;
             }
         }
         Ok(())
@@ -1298,15 +1615,15 @@ impl Unit for DirUnit {
 
     fn apply(&self, changes: &[Change]) -> Result<(), UnitError> {
         self.refresh()?;
-        let _one = self.meta.lock();
+        let _one = self.meta()?;
         self.run(changes, None)
     }
 
     fn prepare(&self, txn: &TxnInfo, changes: &[Change]) -> Result<(), UnitError> {
         self.refresh()?;
-        let _one = self.meta.lock();
+        let _one = self.meta()?;
         // 先检查路径，免得提交点之后才发现这个单元做不了。
-        self.plan(changes)?;
+        self.plan(&split_times(changes)?.0)?;
         for s in Self::stages_of(changes) {
             self.sync_staged_file(s)?;
         }
@@ -1319,14 +1636,14 @@ impl Unit for DirUnit {
 
     fn commit_prepared(&self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
         self.refresh()?;
-        let _one = self.meta.lock();
+        let _one = self.meta()?;
         let (_, changes) =
             self.image.prepared()?.into_iter().find(|(t, _)| t.id == txn).ok_or(UnitError::UnknownTxn(txn))?;
         self.run(&changes, Some((txn, as_primary)))
     }
 
     fn abort_prepared(&self, txn: TxnId) -> Result<(), UnitError> {
-        let _one = self.meta.lock();
+        let _one = self.meta()?;
         let (_, changes) =
             self.image.prepared()?.into_iter().find(|(t, _)| t.id == txn).ok_or(UnitError::UnknownTxn(txn))?;
         self.image.abort_prepared(txn)?;
@@ -1392,10 +1709,23 @@ impl DirSnapshot {
 }
 
 impl Snapshot for DirSnapshot {
+    /// 路径实体的长度取自宿主文件；文件和目录实体带上宿主上的修改时间（`tagfs:hostfs_mtime`）。
     fn get(&self, id: &EntityId) -> Result<Option<EntityRecord>, UnitError> {
         let Some(mut rec) = self.inner.get(id)? else { return Ok(None) };
-        if let Some((_, m)) = self.host_file(&rec.tags)? {
-            rec.size = m.map_or(0, |m| m.len());
+        let meta = match self.host_file(&rec.tags)? {
+            Some((_, m)) => {
+                rec.size = m.as_ref().map_or(0, |m| m.len());
+                m
+            }
+            None => match dir_of(&rec.tags)? {
+                Some(d) => d.inspect(&self.root)?.filter(|m| m.is_dir()),
+                None => None,
+            },
+        };
+        if let Some(ns) = meta.as_ref().and_then(mtime_of) {
+            rec.tags.retain(|t| !is_mtime(t));
+            rec.tags.push(mtime_tag(ns));
+            rec.tags = tagfs_core::tag::normalized(&rec.tags);
         }
         Ok(Some(rec))
     }

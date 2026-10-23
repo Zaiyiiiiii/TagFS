@@ -8,9 +8,13 @@
 //! | 对象 | `04` 对象编号 | 引用数、长度、内联内容 |
 //! | 对象区段 | `05` 对象编号 逻辑块号 | 物理块号、块数 |
 //! | 准备记录 | `06` 事务 片号 | 记录的一片 |
-//! | 已提交事务 | `07` 事务 | 事务描述 |
+//! | 已提交事务 | `07` 事务 | 事务描述、属主 |
 //! | 附加记录 | `08` 任意 | 任意（上层单元自用） |
-//! | 暂存 | `09` 对象编号 | 空 |
+//! | 暂存 | `09` 对象编号 | 属主 |
+//! | 准备记录的属主 | `0A` 事务 | 属主 |
+//!
+//! 属主是写下这条记录的进程的身份（见 `tagfs_device::Share`）。只有一个进程用的设备上是 0；
+//! 早先的格式里没有，读出来也当 0。
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -30,6 +34,18 @@ pub(crate) const COMMITTED: u8 = 7;
 pub(crate) const AUX: u8 = 8;
 /// 暂存的内容：一个还没有实体引用的对象（引用数为 0），编号就是暂存的编号。
 pub(crate) const STAGED: u8 = 9;
+pub(crate) const TXN_OWNER: u8 = 10;
+
+pub(crate) fn txn_owner(txn: &TxnId) -> Vec<u8> {
+    let mut k = vec![TXN_OWNER];
+    k.extend_from_slice(&txn.0);
+    k
+}
+
+/// 记录里的属主：8 字节小端；没有（早先的格式）时为 0。
+pub(crate) fn decode_owner(v: &[u8]) -> u64 {
+    v.try_into().map_or(0, u64::from_le_bytes)
+}
 
 pub(crate) fn staged(o: u64) -> Vec<u8> {
     let mut k = vec![STAGED];

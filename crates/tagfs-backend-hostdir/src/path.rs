@@ -54,6 +54,11 @@ impl HostPath {
         &self.0
     }
 
+    /// 各级上层目录（挂载目录本身除外），由浅到深。
+    pub fn ancestors(&self) -> Vec<HostPath> {
+        (1..self.0.len()).map(|n| HostPath(self.0[..n].to_vec())).collect()
+    }
+
     pub fn value(&self) -> String {
         let mut s = String::new();
         for p in &self.0 {

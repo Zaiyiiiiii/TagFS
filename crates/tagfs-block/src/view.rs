@@ -206,14 +206,20 @@ impl<D: BlockDevice + ?Sized> View<'_, D> {
         Ok(out)
     }
 
-    /// 全部准备记录。
-    pub(crate) fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError> {
+    /// 全部准备记录和各自的属主。
+    pub(crate) fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>, u64)>, UnitError> {
         let mut raw: BTreeMap<[u8; 16], Vec<u8>> = BTreeMap::new();
         self.tree.scan_prefix(self.dev, &[keys::PREPARED], &mut |k, v| {
             raw.entry(Reader::new(&k[1..]).id16()?).or_default().extend_from_slice(v);
             Ok(true)
         })?;
-        raw.values().map(|b| decode_prepared(b)).collect()
+        raw.iter()
+            .map(|(txn, b)| {
+                let (info, changes) = decode_prepared(b)?;
+                let owner = self.tree.get(self.dev, &keys::txn_owner(&TxnId(*txn)))?;
+                Ok((info, changes, owner.map_or(0, |v| keys::decode_owner(&v))))
+            })
+            .collect()
     }
 
     pub(crate) fn prepared_one(&self, txn: &TxnId) -> Result<Option<(TxnInfo, Vec<Change>)>, UnitError> {
@@ -235,20 +241,23 @@ impl<D: BlockDevice + ?Sized> View<'_, D> {
         }
     }
 
-    /// 全部暂存。
-    pub(crate) fn stages(&self) -> Result<Vec<StageId>, UnitError> {
+    /// 全部暂存和各自的属主。
+    pub(crate) fn stages(&self) -> Result<Vec<(StageId, u64)>, UnitError> {
         let mut out = Vec::new();
-        self.tree.scan_prefix(self.dev, &[keys::STAGED], &mut |k, _| {
-            out.push(StageId(Reader::new(&k[1..]).be_u64()?));
+        self.tree.scan_prefix(self.dev, &[keys::STAGED], &mut |k, v| {
+            out.push((StageId(Reader::new(&k[1..]).be_u64()?), keys::decode_owner(v)));
             Ok(true)
         })?;
         Ok(out)
     }
 
-    pub(crate) fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {
+    /// 已提交事务的记录和各自的属主。
+    pub(crate) fn committed(&self) -> Result<Vec<(TxnInfo, u64)>, UnitError> {
         let mut out = Vec::new();
         self.tree.scan_prefix(self.dev, &[keys::COMMITTED], &mut |_, v| {
-            out.push(codec::txn_info(&mut Reader::new(v))?);
+            let mut r = Reader::new(v);
+            let info = codec::txn_info(&mut r)?;
+            out.push((info, keys::decode_owner(r.rest())));
             Ok(true)
         })?;
         Ok(out)

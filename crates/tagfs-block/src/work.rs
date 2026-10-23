@@ -315,7 +315,7 @@ impl<D: BlockDevice> Work<'_, D> {
 
     pub(crate) fn new_stage(&mut self) -> Result<StageId, UnitError> {
         let o = self.new_object(0)?;
-        self.put(keys::staged(o), Vec::new())?;
+        self.put(keys::staged(o), self.s.owner.to_le_bytes().to_vec())?;
         Ok(StageId(o))
     }
 
@@ -434,7 +434,7 @@ impl<D: BlockDevice> Work<'_, D> {
         for (i, part) in payload.chunks(PREPARED_CHUNK).enumerate() {
             self.put(keys::prepared_chunk(&info.id, i as u32), part.to_vec())?;
         }
-        Ok(())
+        self.put(keys::txn_owner(&info.id), self.s.owner.to_le_bytes().to_vec())
     }
 
     /// 删掉准备记录，返回它是否存在。
@@ -443,6 +443,7 @@ impl<D: BlockDevice> Work<'_, D> {
         for k in &ks {
             self.del(k)?;
         }
+        self.del(&keys::txn_owner(txn))?;
         Ok(!ks.is_empty())
     }
 
@@ -453,6 +454,7 @@ impl<D: BlockDevice> Work<'_, D> {
     pub(crate) fn put_committed(&mut self, info: &TxnInfo) -> Result<(), UnitError> {
         let mut v = Vec::new();
         crate::codec::put_txn_info(&mut v, info);
+        put_u64(&mut v, self.s.owner);
         self.put(keys::committed(&info.id), v)
     }
 

@@ -77,6 +77,24 @@ fn by_path(u: &dyn Unit, path: &str) -> Option<EntityId> {
     hits.first().copied()
 }
 
+fn d(v: &str) -> Tag {
+    Tag::new("tagfs", "hostfs_dir", v)
+}
+
+/// 带某个目录路径的实体。
+fn by_dir(u: &dyn Unit, path: &str) -> Option<EntityId> {
+    let s = u.snapshot();
+    let tag = d(path);
+    let hits = s.probe(&tagfs_core::Probe::Is(&tag)).unwrap().unwrap();
+    assert!(hits.len() <= 1, "one entity per directory");
+    hits.first().copied()
+}
+
+/// 去掉读的时候现取的修改时间，剩下存着的 Tag。
+fn stored(tags: &[Tag]) -> Vec<Tag> {
+    tags.iter().filter(|t| t.key.as_str() != HOSTFS_MTIME).cloned().collect()
+}
+
 /// 镜像里存的内容长度：路径实体的内容不应留在镜像里。
 fn image_size(u: &DirUnit, id: &EntityId) -> u64 {
     u.image().snapshot().get(id).unwrap().unwrap().size
@@ -105,23 +123,25 @@ fn existing_files_become_entities_with_their_paths() {
     std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
 
     let (unit, report) = DirUnit::create(&root, UnitId([1; 16]), ids()).unwrap();
-    assert_eq!(report.added, 2);
+    assert_eq!(report.added, 4, "two files and two directories");
     #[cfg(unix)]
     assert_eq!(report.skipped, 1, "the symlink is neither mapped nor followed");
     let song = by_path(&unit, "/music/live/song.mp3").unwrap();
     assert_eq!(content(&unit, &song), b"la la");
-    assert_eq!(unit.snapshot().get(&song).unwrap().unwrap().tags, vec![p("/music/live/song.mp3")]);
+    let tags = unit.snapshot().get(&song).unwrap().unwrap().tags;
+    assert_eq!(stored(&tags), vec![p("/music/live/song.mp3")]);
     assert_eq!(image_size(&unit, &song), 0, "content is not copied into the image");
-    assert_eq!(unit.snapshot().all().unwrap().len(), 2);
+    assert!(by_dir(&unit, "/music").is_some() && by_dir(&unit, "/music/live").is_some());
+    assert_eq!(unit.snapshot().all().unwrap().len(), 4);
 }
 
 #[test]
 fn a_path_creates_the_file_and_missing_directories() {
     let (root, unit) = fresh("create");
     let c = new_entity(&unit, eid(1), vec![p("/abc/bcd/1.file"), Tag::new("user", "n", "x")], b"data");
-    let Change::Create { content: Some(stage), .. } = c else { unreachable!() };
+    let Change::Create { content: Some(_stage), .. } = c else { unreachable!() };
     #[cfg(unix)]
-    let staged_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(unit.staged_file(stage)).unwrap());
+    let staged_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(unit.staged_file(_stage)).unwrap());
     unit.apply(&[c]).unwrap();
     assert_eq!(fs::read(root.join("abc/bcd/1.file")).unwrap(), b"data");
     // 暂存文件直接改名成了目标文件，没有复制。
@@ -307,7 +327,10 @@ fn host_changes_show_up_right_away() {
     assert_eq!(by_path(&unit, "/docs/new.txt"), None);
 
     fs::remove_file(root.join("papers/new.txt")).unwrap();
-    eventually(|| unit.snapshot().all().unwrap().is_empty());
+    // 目录还在，它的实体也还在。
+    eventually(|| unit.snapshot().all().unwrap().len() == 1);
+    assert!(by_dir(&unit, "/papers").is_some());
+    assert!(by_dir(&unit, "/docs").is_none());
 }
 
 #[test]
@@ -403,6 +426,146 @@ fn an_interrupted_change_is_finished_when_reopened() {
         assert_eq!(staged_files(&root), 0);
         unit.image().verify().unwrap();
     }
+}
+
+/// 同一个目录挂两次：各有各的锁句柄，和两个进程一样。
+#[test]
+fn two_mounts_of_one_directory_stay_consistent() {
+    let (root, a) = fresh("two-mounts");
+    fs::write(root.join("seen.txt"), b"by both").unwrap();
+    // 两个“进程”的身份来源不能给出同样的编号。
+    let (b, report) = DirUnit::open(&root, Box::new(Counter(5000))).unwrap();
+    assert_eq!(report.added, 1);
+    // a 自己也对账到这个文件：认得出 b 已经建了实体，不再建一个。
+    a.rescan().unwrap();
+    assert_eq!(a.snapshot().all().unwrap().len(), 1);
+    let seen = by_path(&a, "/seen.txt").unwrap();
+    assert_eq!(by_path(&b, "/seen.txt"), Some(seen));
+
+    // 一边经路径建、改名，另一边看得到。
+    create(&a, eid(1), vec![p("/dir/new.txt")], b"from a");
+    assert_eq!(content(&b, &eid(1)), b"from a");
+    b.apply(&[
+        Change::RemoveTag { id: eid(1), tag: p("/dir/new.txt") },
+        Change::AddTag { id: eid(1), tag: p("/moved.txt") },
+    ])
+    .unwrap();
+    assert_eq!(fs::read(root.join("moved.txt")).unwrap(), b"from a");
+    assert_eq!(by_path(&a, "/moved.txt"), Some(eid(1)));
+    b.write(&eid(1), 0, b"FROM").unwrap();
+    assert_eq!(content(&a, &eid(1)), b"FROM a");
+    // 没有路径的实体在镜像里，两边共用。
+    create(&b, eid(2), vec![], b"inside");
+    assert_eq!(content(&a, &eid(2)), b"inside");
+
+    // 等两边都收到这些改动的通知并对完账：没有多出来的实体（三个文件，一个空下来的目录 /dir）。
+    eventually(|| {
+        a.refresh().unwrap();
+        b.refresh().unwrap();
+        a.snapshot().all().unwrap().len() == 4 && b.snapshot().all().unwrap().len() == 4
+    });
+    assert!(by_dir(&a, "/dir").is_some());
+    a.image().verify().unwrap();
+}
+
+#[test]
+fn directories_are_entities_too() {
+    let (root, unit) = fresh("dirs");
+    // 建一个空目录，它留得住。
+    unit.apply(&[Change::Create { id: eid(1), tags: vec![d("/empty/inner")], content: None }]).unwrap();
+    assert!(root.join("empty/inner").is_dir());
+    assert!(by_dir(&unit, "/empty").is_some(), "the parent made along the way is an entity too");
+    assert_eq!(by_dir(&unit, "/empty/inner"), Some(eid(1)));
+    unit.rescan().unwrap();
+    assert_eq!(by_dir(&unit, "/empty/inner"), Some(eid(1)), "a rescan keeps it");
+
+    // 目录没有内容，也不能同时是文件，也不能和别的目录、文件撞路径。
+    assert_eq!(unit.write(&eid(1), 0, b"x"), Err(NOT_A_FILE));
+    let both = Change::Create { id: eid(2), tags: vec![d("/x"), p("/y")], content: None };
+    assert_eq!(unit.apply(&[both]), Err(INVALID_PATH));
+    let again = Change::Create { id: eid(2), tags: vec![d("/empty/inner")], content: None };
+    assert_eq!(unit.apply(&[again]), Err(PATH_TAKEN));
+    create(&unit, eid(3), vec![p("/file")], b"f");
+    let over = Change::Create { id: eid(2), tags: vec![d("/file")], content: None };
+    assert_eq!(unit.apply(&[over]), Err(PATH_TAKEN));
+
+    // 改目录的路径，连同里面的文件一起改：整个目录搬过去，旧目录删掉。
+    create(&unit, eid(4), vec![p("/empty/inner/a.txt")], b"A");
+    unit.apply(&[
+        Change::RemoveTag { id: eid(1), tag: d("/empty/inner") },
+        Change::AddTag { id: eid(1), tag: d("/moved") },
+        Change::RemoveTag { id: eid(4), tag: p("/empty/inner/a.txt") },
+        Change::AddTag { id: eid(4), tag: p("/moved/a.txt") },
+    ])
+    .unwrap();
+    assert!(!root.join("empty/inner").exists());
+    assert_eq!(fs::read(root.join("moved/a.txt")).unwrap(), b"A");
+    assert_eq!(by_dir(&unit, "/moved"), Some(eid(1)));
+
+    // 删目录：里面还有文件时目录留着，实体随即补回来。
+    unit.apply(&[Change::Delete { id: eid(1) }]).unwrap();
+    assert!(root.join("moved").is_dir());
+    assert!(by_dir(&unit, "/moved").is_some());
+    let moved = by_dir(&unit, "/moved").unwrap();
+    unit.apply(&[Change::Delete { id: eid(4) }, Change::Delete { id: moved }]).unwrap();
+    assert!(!root.join("moved").exists());
+    assert_eq!(by_dir(&unit, "/moved"), None);
+    unit.image().verify().unwrap();
+}
+
+#[test]
+fn modification_times_come_from_the_host() {
+    let (root, unit) = fresh("mtime");
+    create(&unit, eid(1), vec![p("/a.txt")], b"a");
+    let mtime = |id: &EntityId| {
+        unit.snapshot().get(id).unwrap().unwrap().tags.iter().find_map(|t| match (t.key.as_str(), &t.value) {
+            (HOSTFS_MTIME, tagfs_core::Value::Uint(ns)) => Some(*ns),
+            _ => None,
+        })
+    };
+    let host = |path: &str| {
+        let m = fs::metadata(root.join(path)).unwrap().modified().unwrap();
+        m.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    };
+    assert_eq!(mtime(&eid(1)), Some(host("a.txt")));
+    // 写它就是改宿主上的修改时间；它不进镜像。
+    let when = 1_600_000_000_000_000_000u64;
+    unit.apply(&[Change::AddTag { id: eid(1), tag: Tag::new("tagfs", HOSTFS_MTIME, when) }]).unwrap();
+    assert_eq!(host("a.txt"), when);
+    assert_eq!(mtime(&eid(1)), Some(when));
+    assert!(unit.image().snapshot().get(&eid(1)).unwrap().unwrap().tags.iter().all(|t| t.key.as_str() != HOSTFS_MTIME));
+    // 目录也一样。
+    unit.apply(&[Change::Create {
+        id: eid(2),
+        tags: vec![d("/dir"), Tag::new("tagfs", HOSTFS_MTIME, when)],
+        content: None,
+    }])
+    .unwrap();
+    assert_eq!(host("dir"), when);
+    assert_eq!(mtime(&eid(2)), Some(when));
+    // 没有路径的实体没有修改时间。
+    create(&unit, eid(3), vec![], b"inside");
+    assert_eq!(mtime(&eid(3)), None);
+}
+
+/// 一个挂载做到一半就不在了（意图记录还在）：另一个挂载下一次改动时把它做完。
+#[test]
+fn another_mount_finishes_an_interrupted_change() {
+    let (root, a) = fresh("finish-for-other");
+    create(&a, eid(1), vec![p("/a")], b"A");
+    let (b, _) = DirUnit::open(&root, Box::new(Counter(5000))).unwrap();
+    let changes = [Change::RemoveTag { id: eid(1), tag: p("/a") }, Change::AddTag { id: eid(1), tag: p("/z/a") }];
+    // a 只做了第 1 步。
+    let plan = a.plan(&changes).unwrap();
+    let aux = [Aux::Put(AUX_INTENT.to_vec(), plan.intent.encode())];
+    a.image.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() }).unwrap();
+    drop(a);
+    create(&b, eid(2), vec![p("/b")], b"B");
+    assert_eq!(fs::read(root.join("z/a")).unwrap(), b"A");
+    assert!(!root.join("a").exists());
+    assert!(b.image().aux_get(AUX_INTENT).unwrap().is_none());
+    assert_eq!(fs::read(root.join("b")).unwrap(), b"B");
+    b.image().verify().unwrap();
 }
 
 #[test]

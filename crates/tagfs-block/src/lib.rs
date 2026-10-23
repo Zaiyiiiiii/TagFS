@@ -18,6 +18,20 @@
 //!
 //! 被替换下来的块要等两件事才能再分配：盘上最近一次提交不再引用它（否则断电后会读到别的内容），
 //! 并且持有旧版本的读者都结束了。
+//!
+//! ## 多个进程
+//!
+//! 设备带着 [`Share`] 时（宿主上的镜像文件），多个进程可以同时打开同一个单元，没有服务进程：
+//!
+//! - **改**要先拿写者锁。拿到时盘上的提交号和自己记得的不一样，说明别的进程提交过，整个写者状态
+//!   （树根、空闲空间）从盘上重新读。写者锁一直持有到改动都提交了：元数据修改提交完就放；内容写入
+//!   攒着，由 [`Ticker`] 在空闲时（或攒了太久时）提交再放。
+//! - **读**要共享持有读者锁，读之前看一眼超级块，别的进程提交过就换成新的树根。读不等写。
+//! - **释放的块**除了上面两件事，还要等别的进程不再读它：写者能独占读者锁的那一刻，别的进程都没在读，
+//!   之后它们读到的只会是新的提交。盘上因此有两张空闲表：一张是谁都能用的，一张是“刚释放、
+//!   别的进程可能还在读”的，后者要等这样的一刻之后才能用。
+//! - 属于某个进程的东西（暂存、它正在进行的跨单元事务）记着它的身份。别的进程只替已经不在的
+//!   进程收拾它们。
 
 #![no_std]
 
@@ -36,13 +50,14 @@ mod tests;
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use tagfs_core::{Change, EntityId, EntityRecord, Probe, Snapshot, StageId, TxnId, TxnInfo, Unit, UnitError, UnitId};
-use tagfs_device::BlockDevice;
+use tagfs_device::{BlockDevice, Share};
 use tagfs_sync::{Mutex, MutexGuard};
 
 use crate::codec::{Reader, put_u32, put_u64};
@@ -53,7 +68,8 @@ use crate::view::{Extent, View};
 use crate::work::{Work, WritePlan};
 
 const MAGIC: &[u8; 8] = b"TAGFSBLK";
-const VERSION: u32 = 2;
+/// 3 比 2 多了第二张空闲表（[`Super::recent_head`]）。2 仍然能读。
+const VERSION: u32 = 3;
 /// 支持的最小块大小。树的单个条目上限由它决定。
 pub const MIN_BLOCK_SIZE: u32 = 4096;
 const MIN_BLOCKS: u64 = 16;
@@ -61,6 +77,10 @@ const MIN_BLOCKS: u64 = 16;
 const GROW_MIN_BLOCKS: u64 = 4096;
 /// 在锁外复制对象内容时一次搬多少块。
 const COPY_CHUNK_BLOCKS: u64 = 64;
+/// 读超级块时两份都没通过校验（正赶上别的进程连着提交两次）时，重读几次。
+const SUPER_RETRIES: usize = 64;
+/// 内容写入一直不停时，最多攒几次 [`BlockUnit::tick`] 就提交一次。
+const MAX_DIRTY_TICKS: u32 = 40;
 
 /// 打开或格式化失败的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +128,14 @@ struct Super {
     /// 空闲表的第一块；0 表示没有空闲块。
     free_head: u64,
     next_object: u64,
+    /// 第二张空闲表的第一块：刚释放、别的进程可能还在读的块。只有一个进程用的设备上，打开时
+    /// 它们直接算空闲。
+    recent_head: u64,
 }
+
+/// 版本 2 的超级块正文长度（到 CRC 之前）；版本 3 多一个 `recent_head`。
+const SUPER_LEN_V2: usize = 8 + 4 + 4 + 8 + 16 + 8 * 4;
+const SUPER_LEN_V3: usize = SUPER_LEN_V2 + 8;
 
 impl Super {
     fn encode(&self, bs: usize) -> Vec<u8> {
@@ -122,6 +149,7 @@ impl Super {
         put_u64(&mut b, self.root);
         put_u64(&mut b, self.free_head);
         put_u64(&mut b, self.next_object);
+        put_u64(&mut b, self.recent_head);
         let crc = crc32c(&b);
         put_u32(&mut b, crc);
         b.resize(bs, 0);
@@ -129,14 +157,16 @@ impl Super {
     }
 
     fn decode(b: &[u8]) -> Result<Super, OpenError> {
-        const LEN: usize = 8 + 4 + 4 + 8 + 16 + 8 * 4;
-        if b[..8] != MAGIC[..] || u32::from_le_bytes(b[LEN..LEN + 4].try_into().unwrap()) != crc32c(&b[..LEN]) {
+        if b[..8] != MAGIC[..] {
             return Err(OpenError::NotFormatted);
         }
-        let mut r = Reader::new(&b[8..LEN]);
+        let crc_ok = |len: usize| u32::from_le_bytes(b[len..len + 4].try_into().unwrap()) == crc32c(&b[..len]);
+        let len = [SUPER_LEN_V3, SUPER_LEN_V2].into_iter().find(|&l| crc_ok(l)).ok_or(OpenError::NotFormatted)?;
+        let mut r = Reader::new(&b[8..len]);
         let version = r.u32()?;
-        if version != VERSION {
-            return Err(OpenError::UnsupportedVersion(version));
+        match (version, len) {
+            (VERSION, SUPER_LEN_V3) | (2, SUPER_LEN_V2) => {}
+            _ => return Err(OpenError::UnsupportedVersion(version)),
         }
         Ok(Super {
             block_size: r.u32()?,
@@ -146,8 +176,25 @@ impl Super {
             root: r.u64()?,
             free_head: r.u64()?,
             next_object: r.u64()?,
+            recent_head: if r.is_empty() { 0 } else { r.u64()? },
         })
     }
+}
+
+/// 两份超级块里校验通过、提交号最大的那份。
+fn read_super<D: BlockDevice + ?Sized>(dev: &D, bs: usize) -> Result<Super, OpenError> {
+    let mut best: Option<Super> = None;
+    let mut first_err = OpenError::NotFormatted;
+    for slot in 0..2 {
+        let buf = tree::read_block(dev, slot, bs)?;
+        match Super::decode(&buf) {
+            Ok(sb) if best.as_ref().is_none_or(|b| sb.generation > b.generation) => best = Some(sb),
+            Ok(_) => {}
+            Err(e @ OpenError::UnsupportedVersion(_)) => first_err = e,
+            Err(_) => {}
+        }
+    }
+    best.ok_or(first_err)
 }
 
 /// 空闲表块：CRC（覆盖 4 到块尾）、本块区段数 u32、下一块 u64、区段（起始 u64、块数 u64）。
@@ -187,6 +234,8 @@ struct Released {
     blocks: ExtentSet,
     /// 最近一次提交还引用它们：下一次提交之后才算空闲。
     after_commit: bool,
+    /// 别的进程可能还在读它们（它们出现在某次提交里）：要等别的进程都不在读的一刻之后才算空闲。
+    drain: bool,
 }
 
 /// 写者的状态。一次改动失败时整个恢复成改动前的样子，所以要能便宜地复制（树只复制根）。
@@ -203,7 +252,7 @@ pub(crate) struct State {
     /// 已经分配、正在锁外写入、还没登记的块。
     pub(crate) inflight: ExtentSet,
     pending: Vec<Released>,
-    /// 当前空闲表占用的块。
+    /// 当前空闲表（两张）占用的块。
     free_list: Vec<u64>,
     /// 当前公布的版本号。
     epoch: u64,
@@ -211,6 +260,20 @@ pub(crate) struct State {
     dirty: bool,
     /// 写超级块出错后不知道盘上是哪个状态，不再接受写入。
     broken: bool,
+    /// 本进程的身份，记进属于它的记录；只有一个进程用的设备上是 0。
+    pub(crate) owner: u64,
+    /// 持有写者锁。只有一个进程用的设备上一直为真。
+    writer: bool,
+    /// 读者换过树根，空闲空间的记账已经过时：拿到写者锁时要从盘上重读。
+    space_stale: bool,
+    /// [`Hold`] 的个数：有它时不放写者锁。
+    holds: usize,
+    /// 上一次 [`BlockUnit::tick`] 之后有过内容写入。
+    active: bool,
+    /// 没提交的内容写入已经攒了几次 tick。
+    dirty_ticks: u32,
+    /// 上一次没能等到别的进程都不在读，是在哪个提交号上：同一个提交号上不再反复试。
+    drain_tried: Option<u64>,
 }
 
 /// 读者看到的当前版本，和持有各个版本的读者数。
@@ -226,6 +289,10 @@ struct Shared<D> {
     unit: UnitId,
     current: Mutex<Current>,
     state: Mutex<State>,
+    /// 本进程里一次只有一个线程去等写者锁。
+    acquiring: Mutex<()>,
+    /// 和 `State::writer` 相同，读者不拿状态锁就能看。
+    is_writer: AtomicBool,
 }
 
 pub struct BlockUnit<D: BlockDevice> {
@@ -236,16 +303,25 @@ pub struct BlockUnit<D: BlockDevice> {
 struct Pin<D: BlockDevice> {
     s: Arc<Shared<D>>,
     epoch: u64,
+    /// 持有着读者锁，放掉时一起放。
+    held: bool,
 }
 
 impl<D: BlockDevice> Drop for Pin<D> {
     fn drop(&mut self) {
-        let mut cur = self.s.current.lock();
-        if let Some(n) = cur.readers.get_mut(&self.epoch) {
-            *n -= 1;
-            if *n == 0 {
-                cur.readers.remove(&self.epoch);
+        {
+            let mut cur = self.s.current.lock();
+            if let Some(n) = cur.readers.get_mut(&self.epoch) {
+                *n -= 1;
+                if *n == 0 {
+                    cur.readers.remove(&self.epoch);
+                }
             }
+        }
+        if self.held
+            && let Some(share) = self.s.dev.share()
+        {
+            share.release_readers();
         }
     }
 }
@@ -264,33 +340,74 @@ fn unreserve(st: &mut State, blocks: &[(u64, u64)]) {
 }
 
 /// 一次改动的收尾：本次释放的块按“从下一个版本起不再引用”记下，树里被复制走的盘上节点也算释放。
+/// 最近一次提交还引用的块出现在盘上，别的进程可能在读；之后才分配的没有。
 fn settle<D: BlockDevice>(mut w: Work<'_, D>) {
     for b in core::mem::take(&mut w.s.tree.replaced) {
         w.release(b, 1);
     }
     let epoch = w.s.epoch + 1;
-    for (blocks, after_commit) in [(w.durable, true), (w.young, false)] {
+    for (blocks, durable) in [(w.durable, true), (w.young, false)] {
         if !blocks.is_empty() {
-            w.s.pending.push(Released { epoch, blocks, after_commit });
+            w.s.pending.push(Released { epoch, blocks, after_commit: durable, drain: durable });
+        }
+    }
+}
+
+/// 让一个线程一直持有写者锁的凭据，见 [`BlockUnit::hold`]。
+pub struct Hold<'a, D: BlockDevice + 'static> {
+    unit: &'a BlockUnit<D>,
+}
+
+impl<D: BlockDevice + 'static> Drop for Hold<'_, D> {
+    fn drop(&mut self) {
+        let mut st = self.unit.lock();
+        st.holds -= 1;
+        self.unit.release(&mut st);
+    }
+}
+
+/// 给后台线程用的单元句柄：不让单元活着，单元关掉之后 [`Ticker::tick`] 返回 `false`。
+pub struct Ticker<D: BlockDevice> {
+    s: Weak<Shared<D>>,
+}
+
+impl<D: BlockDevice + 'static> Ticker<D> {
+    /// 见 [`BlockUnit::tick`]。单元已经关掉时返回 `false`。
+    pub fn tick(&self) -> bool {
+        match self.s.upgrade() {
+            Some(s) => {
+                let _ = BlockUnit { s }.tick();
+                true
+            }
+            None => false,
         }
     }
 }
 
 impl<D: BlockDevice + 'static> BlockUnit<D> {
-    fn new(dev: D, sb: Super, free: ExtentSet, free_list: Vec<u64>) -> Self {
+    fn new(dev: D, sb: Super, free: ExtentSet, free_list: Vec<u64>, pending: Vec<Released>) -> Self {
         let bs = sb.block_size as usize;
         let tree = Tree::open((sb.root != 0).then_some(sb.root), bs);
+        let owner = dev.share().map_or(0, |s| s.owner());
+        let writer = dev.share().is_none();
         let state = State {
             tree: tree.view(),
             next_object: sb.next_object,
             free,
             fresh: ExtentSet::new(),
             inflight: ExtentSet::new(),
-            pending: Vec::new(),
+            pending,
             free_list,
             epoch: 0,
             dirty: false,
             broken: false,
+            owner,
+            writer,
+            space_stale: false,
+            holds: 0,
+            active: false,
+            dirty_ticks: 0,
+            drain_tried: None,
             sb: sb.clone(),
         };
         BlockUnit {
@@ -300,11 +417,13 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                 unit: sb.unit,
                 current: Mutex::new(Current { tree, epoch: 0, readers: BTreeMap::new() }),
                 state: Mutex::new(state),
+                acquiring: Mutex::new(()),
+                is_writer: AtomicBool::new(writer),
             }),
         }
     }
 
-    /// 在设备上建一个空单元，覆盖原有内容。
+    /// 在设备上建一个空单元，覆盖原有内容。设备和别的进程共用时，调用者要保证此时没有别的进程在用它。
     pub fn format(dev: D, unit: UnitId) -> Result<Self, OpenError> {
         let bs = dev.block_size();
         if bs < MIN_BLOCK_SIZE || !bs.is_power_of_two() {
@@ -314,68 +433,104 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         if blocks < MIN_BLOCKS {
             return Err(OpenError::TooSmall);
         }
+        if let Some(share) = dev.share() {
+            device_err(share.lock_writer())?;
+        }
         let zero = vec![0u8; bs as usize];
         for slot in 0..2 {
             device_err(dev.write_at(slot * bs as u64, &zero))?;
         }
         let mut free = ExtentSet::new();
         free.insert(2, blocks - 2);
-        let sb = Super { block_size: bs, blocks, unit, generation: 0, root: 0, free_head: 0, next_object: 1 };
-        let me = Self::new(dev, sb, free, Vec::new());
+        let sb = Super {
+            block_size: bs,
+            blocks,
+            unit,
+            generation: 0,
+            root: 0,
+            free_head: 0,
+            next_object: 1,
+            recent_head: 0,
+        };
+        let me = Self::new(dev, sb, free, Vec::new(), Vec::new());
         {
             let mut st = me.lock();
+            me.became_writer(&mut st);
             st.dirty = true;
             me.commit(&mut st)?;
+            me.release(&mut st);
         }
         Ok(me)
     }
 
-    /// 挂载已有的单元。断电前没用上的暂存在这里回收。
+    /// 挂载已有的单元。已经不在的进程（只有一个进程用的设备上：断电前）没用上的暂存在这里回收。
     pub fn open(dev: D) -> Result<Self, OpenError> {
         let bs = dev.block_size();
         if bs < MIN_BLOCK_SIZE || !bs.is_power_of_two() {
             return Err(OpenError::BadBlockSize);
         }
-        let mut best: Option<Super> = None;
-        let mut first_err = OpenError::NotFormatted;
-        for slot in 0..2 {
-            let buf = tree::read_block(&dev, slot, bs as usize)?;
-            match Super::decode(&buf) {
-                Ok(sb) if best.as_ref().is_none_or(|b| sb.generation > b.generation) => best = Some(sb),
-                Ok(_) => {}
-                Err(e @ OpenError::UnsupportedVersion(_)) => first_err = e,
-                Err(_) => {}
+        // 和别的进程共用时，在写者锁里读：这样读到的空闲空间不会正被别人改。
+        if let Some(share) = dev.share() {
+            device_err(share.lock_writer())?;
+        }
+        let loaded = (|| {
+            device_err(dev.refresh())?;
+            let sb = read_super(&dev, bs as usize)?;
+            if sb.block_size != bs {
+                return Err(OpenError::BadBlockSize);
             }
+            if sb.blocks > dev.capacity() / bs as u64 {
+                return Err(OpenError::TooSmall);
+            }
+            let space = read_space(&dev, bs as usize, &sb)?;
+            Ok((sb, space))
+        })();
+        let (sb, (mut free, recent, free_list)) = match loaded {
+            Ok(x) => x,
+            Err(e) => {
+                if let Some(share) = dev.share() {
+                    share.unlock_writer();
+                }
+                return Err(e);
+            }
+        };
+        let mut pending = Vec::new();
+        if dev.share().is_some() {
+            if !recent.is_empty() {
+                pending.push(Released { epoch: 0, blocks: recent, after_commit: false, drain: true });
+            }
+        } else {
+            free.extend(&recent);
         }
-        let sb = best.ok_or(first_err)?;
-        if sb.block_size != bs {
-            return Err(OpenError::BadBlockSize);
-        }
-        if sb.blocks > dev.capacity() / bs as u64 {
-            return Err(OpenError::TooSmall);
-        }
-        let (free, free_list) = read_free_list(&dev, bs as usize, sb.free_head, sb.blocks)?;
-        let me = Self::new(dev, sb, free, free_list);
+        let me = Self::new(dev, sb, free, free_list, pending);
+        me.became_writer(&mut me.lock());
         me.drop_unclaimed_stages()?;
         Ok(me)
     }
 
-    /// 没有准备记录引用的暂存：上次没用上就断了，回收。
+    /// 没有准备记录引用、属主也已经不在的暂存：没用上就断了，回收。
     fn drop_unclaimed_stages(&self) -> Result<(), UnitError> {
-        let claimed: BTreeSet<StageId> = self
-            .prepared()?
+        let (stages, prepared) = self.view(|v| Ok((v.stages()?, v.prepared()?)))?;
+        let claimed: BTreeSet<StageId> = prepared
             .iter()
-            .flat_map(|(_, changes)| changes.iter())
+            .flat_map(|(_, changes, _)| changes.iter())
             .filter_map(|c| match c {
                 Change::Create { content: Some(s), .. } => Some(*s),
                 _ => None,
             })
             .collect();
-        let stale: Vec<StageId> = self.stages()?.into_iter().filter(|s| !claimed.contains(s)).collect();
-        if !stale.is_empty() {
-            self.transact(|w| stale.iter().try_for_each(|s| w.discard_stage(*s)))?;
+        let mut stale = Vec::new();
+        for (s, owner) in stages {
+            if !claimed.contains(&s) && self.abandoned(owner) {
+                stale.push(s);
+            }
         }
-        Ok(())
+        if stale.is_empty() {
+            // 打开时拿着的写者锁在这里放掉。
+            self.release(&mut self.lock());
+            return Ok(());
+        }
+        self.transact(|w| stale.iter().try_for_each(|s| w.discard_stage(*s)))
     }
 
     /// 底层设备（测试里用来模拟断电）。
@@ -404,6 +559,41 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         self.lock().sb.blocks
     }
 
+    /// 给后台线程用的句柄。和别的进程共用设备时，要有人定期调 [`Ticker::tick`]：
+    /// 没提交的内容写入会一直占着写者锁。
+    pub fn ticker(&self) -> Ticker<D> {
+        Ticker { s: Arc::downgrade(&self.s) }
+    }
+
+    /// 后台定期调用（例如每 25 毫秒）：上一次之后没有新的内容写入（或者已经攒了太久），就把攒着的
+    /// 内容写入提交掉，并放掉写者锁，让别的进程能改。只有一个进程用的设备上什么都不做。
+    pub fn tick(&self) -> Result<(), UnitError> {
+        if self.s.dev.share().is_none() {
+            return Ok(());
+        }
+        let mut st = self.lock();
+        if !st.writer {
+            return Ok(());
+        }
+        if st.dirty {
+            if core::mem::take(&mut st.active) && st.dirty_ticks < MAX_DIRTY_TICKS {
+                st.dirty_ticks += 1;
+                return Ok(());
+            }
+            self.run(&mut st, true, &mut |_| Ok(()))?;
+        }
+        self.release(&mut st);
+        Ok(())
+    }
+
+    /// 拿住写者锁直到返回的凭据放掉。期间别的进程改不了这个单元，本进程也不会放掉写者锁。
+    /// 建在块格式单元之上的单元要让自己的一组操作在进程之间不被打断时用它。
+    pub fn hold(&self) -> Result<Hold<'_, D>, UnitError> {
+        let mut st = self.writer()?;
+        st.holds += 1;
+        Ok(Hold { unit: self })
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.s.state.lock()
     }
@@ -412,21 +602,162 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         self.s.bs as u64
     }
 
+    fn share(&self) -> Option<&dyn Share> {
+        self.s.dev.share()
+    }
+
+    /// 属主已经不在了：它留下的东西没人管，可以替它收拾。只有一个进程用的设备上，单元里的记录都是
+    /// 以前（断电前）留下的。
+    fn abandoned(&self, owner: u64) -> bool {
+        match self.share() {
+            None => true,
+            Some(share) => owner != share.owner() && !share.alive(owner).unwrap_or(true),
+        }
+    }
+
+    /// 这条记录归本进程处理：是本进程的，或者属主已经不在了。
+    fn ours(&self, owner: u64) -> bool {
+        match self.share() {
+            None => true,
+            Some(share) => owner == share.owner() || self.abandoned(owner),
+        }
+    }
+
     fn work<'a>(&'a self, st: &'a mut State) -> Work<'a, D> {
         Work { dev: &self.s.dev, bs: self.bs(), s: st, durable: ExtentSet::new(), young: ExtentSet::new() }
     }
 
+    /// 拿到写者锁之后（或打开、格式化时已经拿着）记下来。
+    fn became_writer(&self, st: &mut State) {
+        st.writer = true;
+        self.s.is_writer.store(true, Ordering::Release);
+    }
+
+    /// 写者状态，拿着写者锁。和别的进程共用设备时，没拿着就先去拿（等别的进程放掉），
+    /// 别的进程提交过就从盘上重读写者状态。
+    fn writer(&self) -> Result<MutexGuard<'_, State>, UnitError> {
+        let Some(share) = self.share() else { return Ok(self.lock()) };
+        {
+            let st = self.lock();
+            if st.writer {
+                return Ok(st);
+            }
+        }
+        let _one = self.s.acquiring.lock();
+        {
+            let st = self.lock();
+            if st.writer {
+                return Ok(st);
+            }
+        }
+        // 等锁时不拿着状态锁：本进程的读者照常读。
+        device_err(share.lock_writer())?;
+        let mut st = self.lock();
+        if let Err(e) = self.refresh(&mut st, true) {
+            share.unlock_writer();
+            return Err(e);
+        }
+        self.became_writer(&mut st);
+        Ok(st)
+    }
+
+    /// 能放就放掉写者锁：改动都提交了、没有正在锁外写的块、没人要求拿住。
+    fn release(&self, st: &mut State) {
+        let Some(share) = self.share() else { return };
+        if st.writer && !st.dirty && st.inflight.is_empty() && st.holds == 0 {
+            st.writer = false;
+            // 先让读者知道自己不再是写者，再放锁：之后开始的读者都会去看盘上的超级块。
+            self.s.is_writer.store(false, Ordering::Release);
+            share.unlock_writer();
+        }
+    }
+
+    /// 别的进程提交过就跟上：换成盘上最新的树根并公布。`full` 时（拿到写者锁时）空闲空间的记账也从盘上重读，
+    /// 否则只记下它过时了。调用者持有读者锁或写者锁。
+    fn refresh(&self, st: &mut State, full: bool) -> Result<(), UnitError> {
+        let dev = &self.s.dev;
+        let bs = self.s.bs;
+        let mut sb = None;
+        for _ in 0..SUPER_RETRIES {
+            match read_super(dev, bs) {
+                Ok(s) => {
+                    sb = Some(s);
+                    break;
+                }
+                // 两份都在被重写（别的进程连着提交了两次），再读一次。
+                Err(OpenError::NotFormatted) => core::hint::spin_loop(),
+                Err(_) => return Err(UnitError::Corrupt),
+            }
+        }
+        let sb = sb.ok_or(UnitError::Corrupt)?;
+        let moved = sb.generation != st.sb.generation;
+        if !moved && !(full && st.space_stale) {
+            return Ok(());
+        }
+        if sb.blocks.saturating_mul(bs as u64) > dev.capacity() {
+            device_err(dev.refresh())?;
+            if sb.blocks.saturating_mul(bs as u64) > dev.capacity() {
+                return Err(UnitError::Corrupt);
+            }
+        }
+        if full {
+            let (free, recent, free_list) = read_space(dev, bs, &sb).map_err(|e| match e {
+                OpenError::Unit(e) => e,
+                _ => UnitError::Corrupt,
+            })?;
+            st.free = free;
+            st.free_list = free_list;
+            st.fresh = ExtentSet::new();
+            st.inflight = ExtentSet::new();
+            // 本进程里还在读旧版本的读者也可能读着它们：等这些读者结束（新的版本号），
+            // 也等别的进程都不在读。
+            st.pending.clear();
+            if !recent.is_empty() {
+                st.pending.push(Released { epoch: st.epoch + 1, blocks: recent, after_commit: false, drain: true });
+            }
+            st.space_stale = false;
+            st.dirty = false;
+        } else {
+            st.space_stale = true;
+        }
+        if moved {
+            st.tree = Tree::open((sb.root != 0).then_some(sb.root), bs);
+            st.next_object = sb.next_object;
+            st.sb = sb;
+        }
+        self.publish(st);
+        Ok(())
+    }
+
     /// 在当前版本上读，读的期间登记为读者。
     fn view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let (tree, _pin) = self.pin_current();
+        let (tree, _pin) = self.pin_current()?;
         f(&View { tree: &tree, dev: &self.s.dev, bs: self.bs() })
     }
 
-    fn pin_current(&self) -> (Tree, Pin<D>) {
+    /// 登记为当前版本的读者。和别的进程共用设备时先共享持有读者锁；不是写者就先跟上别的进程的提交。
+    fn pin_current(&self) -> Result<(Tree, Pin<D>), UnitError> {
+        let held = match self.share() {
+            None => false,
+            Some(share) => {
+                device_err(share.hold_readers())?;
+                if !self.s.is_writer.load(Ordering::Acquire) {
+                    let mut st = self.lock();
+                    if !st.writer
+                        && let Err(e) = self.refresh(&mut st, false)
+                    {
+                        drop(st);
+                        share.release_readers();
+                        return Err(e);
+                    }
+                }
+                true
+            }
+        };
         let mut cur = self.s.current.lock();
         let epoch = cur.epoch;
         *cur.readers.entry(epoch).or_default() += 1;
-        (cur.tree.view(), Pin { s: self.s.clone(), epoch })
+        Ok((cur.tree.view(), Pin { s: self.s.clone(), epoch, held }))
     }
 
     /// 把改好的状态公布成新版本。
@@ -437,16 +768,42 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
             cur.tree = st.tree.view();
             cur.epoch = st.epoch;
         }
-        self.reclaim(st);
+        self.reclaim(st, false);
     }
 
     /// 不再有人引用的已释放块，放回可分配的空间。返回是否放回了什么。
-    fn reclaim(&self, st: &mut State) -> bool {
+    ///
+    /// 等别的进程不在读的块，在每个提交号上只试一次（试要好几次系统调用），`force` 时（空间不够）再试。
+    fn reclaim(&self, st: &mut State, force: bool) -> bool {
+        match self.share() {
+            None => {
+                // 没有别的进程。
+                for r in &mut st.pending {
+                    r.drain = false;
+                }
+            }
+            Some(share) => {
+                if !st.writer {
+                    return false;
+                }
+                let waiting = st.pending.iter().any(|r| r.drain && !r.after_commit);
+                if waiting && (force || st.drain_tried != Some(st.sb.generation)) {
+                    if share.readers_absent().unwrap_or(false) {
+                        st.drain_tried = None;
+                        for r in st.pending.iter_mut().filter(|r| !r.after_commit) {
+                            r.drain = false;
+                        }
+                    } else {
+                        st.drain_tried = Some(st.sb.generation);
+                    }
+                }
+            }
+        }
         let oldest = self.s.current.lock().readers.keys().next().copied();
         let published = st.epoch;
         let (ready, waiting): (Vec<_>, Vec<_>) = core::mem::take(&mut st.pending)
             .into_iter()
-            .partition(|r| !r.after_commit && r.epoch <= published && oldest.is_none_or(|o| o >= r.epoch));
+            .partition(|r| !r.after_commit && !r.drain && r.epoch <= published && oldest.is_none_or(|o| o >= r.epoch));
         st.pending = waiting;
         let any = !ready.is_empty();
         for r in ready {
@@ -456,7 +813,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
     }
 
     /// 在写者状态上做一次改动，`commit` 时随即提交，然后公布。失败时状态不变；空间不够时，
-    /// 先收回能收回的块，再试着扩容，然后整个重做。
+    /// 先收回能收回的块，再试着扩容，然后整个重做。调用者持有写者锁。
     fn run<T>(
         &self,
         st: &mut State,
@@ -486,7 +843,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                     let broken = st.broken;
                     *st = saved;
                     st.broken |= broken;
-                    if e == UnitError::NoSpace && (self.reclaim(st) || self.grow(st)) {
+                    if e == UnitError::NoSpace && (self.reclaim(st, true) || self.grow(st)) {
                         continue;
                     }
                     return Err(e);
@@ -497,14 +854,19 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
 
     /// 一次不提交的改动（内容写入）。
     fn update<T>(&self, mut f: impl FnMut(&mut Work<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let mut st = self.lock();
-        self.run(&mut st, false, &mut f)
+        let mut st = self.writer()?;
+        st.active = true;
+        let r = self.run(&mut st, false, &mut f);
+        self.release(&mut st);
+        r
     }
 
     /// 一次随即提交的改动（元数据修改）。
     fn transact<T>(&self, mut f: impl FnMut(&mut Work<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        let mut st = self.lock();
-        self.run(&mut st, true, &mut f)
+        let mut st = self.writer()?;
+        let r = self.run(&mut st, true, &mut f);
+        self.release(&mut st);
+        r
     }
 
     /// 把写者状态写成新的提交。失败时调用者负责恢复状态。
@@ -519,51 +881,42 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
             let (free, fresh) = (&mut st.free, &mut st.fresh);
             st.tree.flush(dev, &mut || alloc_one(free, fresh), generation)?
         };
-        // 旧的空闲表在这次提交之后就没人引用了。
+        // 旧的空闲表在这次提交之后就没人引用了。只有拿着写者锁的进程读空闲表，所以它们不用等别的进程。
         let mut retired = ExtentSet::new();
         for &b in &st.free_list {
             retired.insert(b, 1);
         }
 
         // 空闲表本身也要占块：先分配，再把分配后的空闲集合写进去。正在锁外写入的块在盘上也算空闲：
-        // 它们还没被登记，断电之后没人引用。
+        // 它们还没被登记，断电之后没人引用。还没能再分配的已释放块进第二张表：下一个写者
+        // （也许是别的进程）要等别的进程都不在读了才能用它们。只有一个进程用的设备上，重新挂载时
+        // 没有任何读者，它们直接进第一张表。
+        let shared = self.share().is_some();
         let per = free_list_per_block(bs);
         let mut list_blocks = Vec::new();
-        let persisted = loop {
-            let mut all = st.free.clone();
-            all.extend(&retired);
-            all.extend(&st.inflight);
+        let (free, recent) = loop {
+            let mut free = st.free.clone();
+            free.extend(&retired);
+            free.extend(&st.inflight);
+            let mut recent = ExtentSet::new();
             for r in &st.pending {
-                all.extend(&r.blocks);
+                if shared { recent.extend(&r.blocks) } else { free.extend(&r.blocks) }
             }
-            if list_blocks.len() >= all.count().div_ceil(per) {
-                break all;
+            if list_blocks.len() >= free.count().div_ceil(per) + recent.count().div_ceil(per) {
+                break (free, recent);
             }
             list_blocks.push(alloc_one(&mut st.free, &mut st.fresh)?);
         };
-        let extents: Vec<(u64, u64)> = persisted.iter().collect();
-        let mut parts = extents.chunks(per);
-        for (i, &b) in list_blocks.iter().enumerate() {
-            let part = parts.next().unwrap_or(&[]);
-            let next = list_blocks.get(i + 1).copied().unwrap_or(0);
-            let mut buf = vec![0u8; 4];
-            put_u32(&mut buf, part.len() as u32);
-            put_u64(&mut buf, next);
-            for &(s, l) in part {
-                put_u64(&mut buf, s);
-                put_u64(&mut buf, l);
-            }
-            buf.resize(bs, 0);
-            let crc = crc32c(&buf[4..]);
-            buf[..4].copy_from_slice(&crc.to_le_bytes());
-            device_err(dev.write_at(b * bs as u64, &buf))?;
-        }
+        let (free_blocks, recent_blocks) = list_blocks.split_at(list_blocks.len() - recent.count().div_ceil(per));
+        write_chain(dev, bs, free_blocks, &free)?;
+        write_chain(dev, bs, recent_blocks, &recent)?;
         device_err(dev.flush())?;
 
         let sb = Super {
             generation,
             root: root.unwrap_or(0),
-            free_head: list_blocks.first().copied().unwrap_or(0),
+            free_head: free_blocks.first().copied().unwrap_or(0),
+            recent_head: recent_blocks.first().copied().unwrap_or(0),
             next_object: st.next_object,
             ..st.sb.clone()
         };
@@ -579,10 +932,11 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
             r.after_commit = false;
         }
         if !retired.is_empty() {
-            st.pending.push(Released { epoch: 0, blocks: retired, after_commit: false });
+            st.pending.push(Released { epoch: 0, blocks: retired, after_commit: false, drain: false });
         }
         st.fresh = st.inflight.clone();
         st.dirty = false;
+        st.dirty_ticks = 0;
         Ok(())
     }
 
@@ -608,11 +962,13 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
     fn write_object(&self, o: u64, offset: u64, data: &[u8]) -> Result<(), UnitError> {
         let Some(plan) = self.update(|w| w.plan_write(o, offset, data))? else { return Ok(()) };
         let written = self.fill_blocks(&plan, offset, data);
+        // 锁外写着的块还没登记，写者锁不会被放掉。
         let mut st = self.lock();
         let r = written.and_then(|()| self.run(&mut st, false, &mut |w| w.finish_write(&plan)));
         if r.is_err() {
             unreserve(&mut st, &plan.blocks);
         }
+        self.release(&mut st);
         r
     }
 
@@ -713,6 +1069,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         if r.is_err() {
             unreserve(&mut st, &blocks);
         }
+        self.release(&mut st);
         r
     }
 
@@ -767,9 +1124,9 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
         })
     }
 
-    /// 现有的全部暂存。
+    /// 现有的全部暂存，含别的进程的。
     pub fn stages(&self) -> Result<Vec<StageId>, UnitError> {
-        self.view(|v| v.stages())
+        self.view(|v| v.stages()).map(|s| s.into_iter().map(|(s, _)| s).collect())
     }
 
     /// 读一条附加记录。
@@ -794,14 +1151,24 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
     pub fn verify(&self) -> Result<(), UnitError> {
         // 在写者状态的一个瞬间上查：拿着那一刻的树和空间记账，登记为读者，之后锁外慢慢查。
         let (tree, free, pending, inflight, free_list, blocks, next_object, _pin) = {
-            let st = self.lock();
+            let mut st = self.writer()?;
+            let held = match self.share() {
+                Some(share) => {
+                    if share.hold_readers().is_err() {
+                        self.release(&mut st);
+                        return Err(UnitError::Device);
+                    }
+                    true
+                }
+                None => false,
+            };
             let pin = {
                 let mut cur = self.s.current.lock();
                 *cur.readers.entry(st.epoch).or_default() += 1;
-                Pin { s: self.s.clone(), epoch: st.epoch }
+                Pin { s: self.s.clone(), epoch: st.epoch, held }
             };
             let pending: Vec<ExtentSet> = st.pending.iter().map(|r| r.blocks.clone()).collect();
-            (
+            let snapshot = (
                 st.tree.view(),
                 st.free.clone(),
                 pending,
@@ -810,7 +1177,9 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                 st.sb.blocks,
                 st.next_object,
                 pin,
-            )
+            );
+            self.release(&mut st);
+            snapshot
         };
         let mut used = ExtentSet::new();
         let claim = |s: u64, l: u64, used: &mut ExtentSet| -> Result<(), UnitError> {
@@ -861,7 +1230,7 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
                 keys::STAGED => {
                     staged.insert(Reader::new(&k[1..]).be_u64()?);
                 }
-                keys::PREPARED | keys::COMMITTED | keys::AUX => {}
+                keys::PREPARED | keys::COMMITTED | keys::AUX | keys::TXN_OWNER => {}
                 _ => return Err(UnitError::Corrupt),
             }
             Ok(true)
@@ -910,14 +1279,51 @@ fn alloc_one(free: &mut ExtentSet, fresh: &mut ExtentSet) -> Result<u64, UnitErr
     Ok(b)
 }
 
-fn read_free_list<D: BlockDevice + ?Sized>(
+/// 把 `set` 写成一张空闲表，占 `blocks` 这些块（按顺序串起来；多出来的块写成空的）。
+fn write_chain<D: BlockDevice + ?Sized>(dev: &D, bs: usize, blocks: &[u64], set: &ExtentSet) -> Result<(), UnitError> {
+    let extents: Vec<(u64, u64)> = set.iter().collect();
+    let mut parts = extents.chunks(free_list_per_block(bs));
+    for (i, &b) in blocks.iter().enumerate() {
+        let part = parts.next().unwrap_or(&[]);
+        let next = blocks.get(i + 1).copied().unwrap_or(0);
+        let mut buf = vec![0u8; 4];
+        put_u32(&mut buf, part.len() as u32);
+        put_u64(&mut buf, next);
+        for &(s, l) in part {
+            put_u64(&mut buf, s);
+            put_u64(&mut buf, l);
+        }
+        buf.resize(bs, 0);
+        let crc = crc32c(&buf[4..]);
+        buf[..4].copy_from_slice(&crc.to_le_bytes());
+        device_err(dev.write_at(b * bs as u64, &buf))?;
+    }
+    Ok(())
+}
+
+/// 读超级块记着的两张空闲表：谁都能用的、等别的进程不在读的，以及它们占用的块。
+fn read_space<D: BlockDevice + ?Sized>(
+    dev: &D,
+    bs: usize,
+    sb: &Super,
+) -> Result<(ExtentSet, ExtentSet, Vec<u64>), OpenError> {
+    let mut list = Vec::new();
+    let mut seen = ExtentSet::new();
+    let free = read_chain(dev, bs, sb.free_head, sb.blocks, &mut list, &mut seen)?;
+    let recent = read_chain(dev, bs, sb.recent_head, sb.blocks, &mut list, &mut seen)?;
+    Ok((free, recent, list))
+}
+
+/// 读一张空闲表。`list` 收集表占用的块，`seen` 是已经读到的全部区段（两张表不能重叠）。
+fn read_chain<D: BlockDevice + ?Sized>(
     dev: &D,
     bs: usize,
     head: u64,
     blocks: u64,
-) -> Result<(ExtentSet, Vec<u64>), UnitError> {
-    let mut free = ExtentSet::new();
-    let mut list = Vec::new();
+    list: &mut Vec<u64>,
+    seen: &mut ExtentSet,
+) -> Result<ExtentSet, UnitError> {
+    let mut out = ExtentSet::new();
     let mut next = head;
     while next != 0 {
         if next >= blocks || list.contains(&next) {
@@ -936,13 +1342,14 @@ fn read_free_list<D: BlockDevice + ?Sized>(
         }
         for _ in 0..count {
             let (s, l) = (r.u64()?, r.u64()?);
-            if s < 2 || l == 0 || s + l > blocks || free.overlaps(s, l) {
+            if s < 2 || l == 0 || s + l > blocks || seen.overlaps(s, l) {
                 return Err(UnitError::Corrupt);
             }
-            free.insert(s, l);
+            seen.insert(s, l);
+            out.insert(s, l);
         }
     }
-    Ok((free, list))
+    Ok(out)
 }
 
 impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
@@ -951,8 +1358,7 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     }
 
     fn snapshot(&self) -> Box<dyn Snapshot> {
-        let (tree, pin) = self.pin_current();
-        Box::new(BlockSnapshot { tree, pin })
+        Box::new(BlockSnapshot { inner: self.pin_current() })
     }
 
     fn write(&self, id: &EntityId, offset: u64, data: &[u8]) -> Result<(), UnitError> {
@@ -966,11 +1372,14 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     }
 
     fn sync(&self) -> Result<(), UnitError> {
-        let mut st = self.lock();
-        if !st.dirty {
+        // 不是写者就没有没提交的东西。
+        if !self.lock().writer {
             return Ok(());
         }
-        self.run(&mut st, true, &mut |_| Ok(()))
+        let mut st = self.writer()?;
+        let r = if st.dirty { self.run(&mut st, true, &mut |_| Ok(())) } else { Ok(()) };
+        self.release(&mut st);
+        r
     }
 
     fn stage(&self) -> Result<StageId, UnitError> {
@@ -994,8 +1403,10 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
         self.transact(|w| w.put_prepared(txn, changes))
     }
 
+    /// 本进程的，和已经不在的进程留下的。别的进程正在进行的事务由它自己了结。
     fn prepared(&self) -> Result<Vec<(TxnInfo, Vec<Change>)>, UnitError> {
-        self.view(|v| v.prepared())
+        let all = self.view(|v| v.prepared())?;
+        Ok(all.into_iter().filter(|(_, _, owner)| self.ours(*owner)).map(|(t, c, _)| (t, c)).collect())
     }
 
     fn commit_prepared(&self, txn: TxnId, as_primary: bool) -> Result<(), UnitError> {
@@ -1026,8 +1437,10 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
         })
     }
 
+    /// 同 [`Unit::prepared`]：别的进程正在进行的事务不在其中。
     fn committed(&self) -> Result<Vec<TxnInfo>, UnitError> {
-        self.view(|v| v.committed())
+        let all = self.view(|v| v.committed())?;
+        Ok(all.into_iter().filter(|(_, owner)| self.ours(*owner)).map(|(t, _)| t).collect())
     }
 
     fn forget(&self, txn: TxnId) -> Result<(), UnitError> {
@@ -1049,14 +1462,15 @@ impl<D: BlockDevice + 'static> Unit for BlockUnit<D> {
     }
 }
 
+/// 拿不到版本（和别的进程共用设备时读超级块失败）时，每次读都报这个错。
 struct BlockSnapshot<D: BlockDevice> {
-    tree: Tree,
-    pin: Pin<D>,
+    inner: Result<(Tree, Pin<D>), UnitError>,
 }
 
 impl<D: BlockDevice> BlockSnapshot<D> {
     fn with_view<T>(&self, f: impl FnOnce(&View<'_, D>) -> Result<T, UnitError>) -> Result<T, UnitError> {
-        f(&View { tree: &self.tree, dev: &self.pin.s.dev, bs: self.pin.s.bs as u64 })
+        let (tree, pin) = self.inner.as_ref().map_err(|e| *e)?;
+        f(&View { tree, dev: &pin.s.dev, bs: pin.s.bs as u64 })
     }
 }
 

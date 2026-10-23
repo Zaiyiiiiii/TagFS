@@ -1,5 +1,7 @@
 extern crate std;
 
+mod shared;
+
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::sync::Arc;

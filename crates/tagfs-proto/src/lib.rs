@@ -652,10 +652,14 @@ pub fn socket_name() -> io::Result<Name<'static>> {
     to_name(name)
 }
 
+/// 含路径分隔符时是文件路径，否则是名字。Windows 的命名管道不在文件系统里：路径（`\\.\pipe\` 开头的除外）
+/// 只当作名字用，同一个路径总是得到同一个管道。
 pub fn to_name(name: String) -> io::Result<Name<'static>> {
-    if name.contains('/') || name.contains('\\') {
+    let is_path = name.contains('/') || name.contains('\\');
+    if is_path && (cfg!(unix) || name.starts_with(r"\\.\pipe\")) {
         name.to_fs_name::<GenericFilePath>()
     } else if GenericNamespaced::is_supported() {
+        let name = if is_path { name.replace(['/', '\\', ':'], "_") } else { name };
         name.to_ns_name::<GenericNamespaced>()
     } else {
         std::env::temp_dir().join(name).into_os_string().to_fs_name::<GenericFilePath>()

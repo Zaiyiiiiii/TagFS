@@ -64,6 +64,45 @@ pub trait BlockDevice: Send + Sync {
         let _ = capacity;
         Err(DeviceError::Unsupported)
     }
+
+    /// 重新取容量：别的进程可能扩了容。只会变大。
+    fn refresh(&self) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    /// 多个进程同时使用这个设备时的协调。只给一个进程用的设备（内存、裸盘）没有它。
+    fn share(&self) -> Option<&dyn Share> {
+        None
+    }
+}
+
+/// 多个进程同时打开同一个设备时的协调，由宿主实现（例如文件锁）。没有服务进程：每个进程自己打开设备，
+/// 靠这里的锁排开彼此。
+///
+/// - **写者锁**：同一时刻只有一个进程改单元。
+/// - **读者锁**：进程读单元时共享持有它。写者能独占它的那一刻，说明没有别的进程在读旧的状态，
+///   别的进程读过的块才能重新分配。
+/// - **属主**：每个打开设备的进程有一个身份。单元里属于某个进程的东西（暂存、进行中的跨单元事务）
+///   记着它的身份；身份不在了（进程退出或崩溃），别的进程才能替它收拾。
+pub trait Share: Send + Sync {
+    /// 拿写者锁，拿不到就等。
+    fn lock_writer(&self) -> Result<(), DeviceError>;
+
+    fn unlock_writer(&self);
+
+    /// 共享持有读者锁。同一个进程里可以重复持有，每次对应一次 [`Share::release_readers`]。
+    fn hold_readers(&self) -> Result<(), DeviceError>;
+
+    fn release_readers(&self);
+
+    /// 此刻是否没有别的进程持有读者锁（不等）。只有持有写者锁的进程调用。
+    fn readers_absent(&self) -> Result<bool, DeviceError>;
+
+    /// 本进程的身份，不为 0。
+    fn owner(&self) -> u64;
+
+    /// 这个身份的进程是否还开着这个设备。本进程自己的身份算开着。
+    fn alive(&self, owner: u64) -> Result<bool, DeviceError>;
 }
 
 /// `offset..offset+len` 是否落在容量为 `capacity` 的设备内。
