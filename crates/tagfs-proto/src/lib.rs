@@ -261,6 +261,11 @@ impl Enc {
                 self.u8(7);
                 self.query(q);
             }
+            Query::Children { ns, key, parent } => {
+                self.u8(8);
+                self.ns_key(ns, key);
+                self.str(parent);
+            }
         }
     }
 }
@@ -358,6 +363,10 @@ impl<'a> Dec<'a> {
                 if k == 5 { Query::And(qs) } else { Query::Or(qs) }
             }
             7 => Query::Not(Box::new(self.query(depth + 1)?)),
+            8 => {
+                let (ns, key) = self.ns_key()?;
+                Query::Children { ns, key, parent: self.str()? }
+            }
             _ => return Err(bad()),
         })
     }
@@ -771,6 +780,7 @@ mod tests {
                         upper: Bound::Excluded(Value::str("z")),
                     },
                     Query::Prefix { ns: Namespace::new("a"), key: Key::new("b"), prefix: "p".into() },
+                    Query::Children { ns: Namespace::new("a"), key: Key::new("b"), parent: "/p/".into() },
                     Query::All,
                 ]),
                 after: Some(id),

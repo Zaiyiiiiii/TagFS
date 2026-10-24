@@ -4,7 +4,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
-use tagfs_core::{Change, EntityId, EntityRecord, Probe, StageId, Tag, TxnId, TxnInfo, UnitError};
+use tagfs_core::{
+    Change, EntityId, EntityRecord, Key, Namespace, Probe, StageId, Tag, TxnId, TxnInfo, UnitError, Value,
+};
 use tagfs_device::BlockDevice;
 
 use crate::codec::{self, Reader, VALUE_STR, put_escaped_open, put_ns_key, put_tag, put_u64, put_value};
@@ -160,8 +162,21 @@ impl<D: BlockDevice + ?Sized> View<'_, D> {
 
     /// 用 Tag 索引回答叶子条件。
     pub(crate) fn probe(&self, probe: &Probe<'_>) -> Result<Vec<EntityId>, UnitError> {
+        let mut out: Vec<EntityId> = self.probe_tags(probe)?.into_iter().map(|(id, _)| id).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// 同 [`View::probe`]，连同命中的 Tag（一个实体在同一个键上有几个值就出现几次），按索引的顺序。
+    /// 只要值的时候不必再逐个取实体。
+    pub(crate) fn probe_tags(&self, probe: &Probe<'_>) -> Result<Vec<(EntityId, Tag)>, UnitError> {
+        if let Probe::Children { ns, key, parent } = *probe {
+            return self.children(ns, key, parent);
+        }
         let mut base = alloc::vec![keys::INDEX];
         let (start, stop): (Vec<u8>, Option<&Bound<_>>) = match *probe {
+            Probe::Children { .. } => unreachable!(),
             Probe::Is(tag) => {
                 put_tag(&mut base, tag);
                 (base.clone(), None)
@@ -197,12 +212,53 @@ impl<D: BlockDevice + ?Sized> View<'_, D> {
                 _ => {}
             }
             if probe.matches(&tag) {
-                out.push(EntityId(k[k.len() - 16..].try_into().unwrap()));
+                out.push((EntityId(k[k.len() - 16..].try_into().unwrap()), tag));
             }
             Ok(true)
         })?;
-        out.sort();
-        out.dedup();
+        Ok(out)
+    }
+
+    /// `parent` 下一层的值。索引按值排序，`<parent><名字>/` 开头的值（更深的层级）都排在
+    /// `<parent><名字>0` 之前（`0` 紧跟在 `/` 后面）：扫到更深一层时从那里接着扫，跳过整棵子树。
+    /// 代价只和直接子项的个数有关。
+    fn children(&self, ns: &Namespace, key: &Key, parent: &str) -> Result<Vec<(EntityId, Tag)>, UnitError> {
+        let mut base = alloc::vec![keys::INDEX];
+        put_ns_key(&mut base, ns, key);
+        base.push(VALUE_STR);
+        put_escaped_open(&mut base, parent.as_bytes());
+        let mut out = Vec::new();
+        let mut from = base.clone();
+        loop {
+            let mut skip_to = None;
+            self.tree.scan(self.dev, &from, &mut |k, _| {
+                if !k.starts_with(&base) || k.len() < 1 + 16 {
+                    return Ok(false);
+                }
+                let tag = Reader::new(&k[1..k.len() - 16]).tag()?;
+                let Value::Str(s) = &tag.value else { return Ok(false) };
+                let Some(rest) = s.strip_prefix(parent) else { return Ok(false) };
+                match rest.find('/') {
+                    None => {
+                        if !rest.is_empty() {
+                            out.push((EntityId(k[k.len() - 16..].try_into().unwrap()), tag.clone()));
+                        }
+                        Ok(true)
+                    }
+                    Some(i) => {
+                        let mut next = base.clone();
+                        put_escaped_open(&mut next, &rest.as_bytes()[..i]);
+                        next.push(b'/' + 1);
+                        skip_to = Some(next);
+                        Ok(false)
+                    }
+                }
+            })?;
+            match skip_to {
+                Some(next) => from = next,
+                None => break,
+            }
+        }
         Ok(out)
     }
 

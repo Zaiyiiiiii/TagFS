@@ -232,6 +232,7 @@ fn same_probes(a: &dyn Snapshot, b: &dyn Snapshot) {
             Probe::Is(&c.tag),
             Probe::Range { ns: &c.ns, key: &c.key, lower: &c.lower, upper: &c.upper },
             Probe::Prefix { ns: &c.ns, key: &c.key, prefix: c.prefix },
+            Probe::Children { ns: &c.ns, key: &c.key, parent: c.prefix },
         ];
         for p in &all {
             assert_eq!(a.probe(p).unwrap(), b.probe(p).unwrap(), "{p:?}");
@@ -319,6 +320,62 @@ fn tags_up_to_the_length_limit_work() {
     ] {
         assert_eq!(reopened.snapshot().probe(&p).unwrap(), reference.snapshot().probe(&p).unwrap());
     }
+}
+
+#[test]
+fn children_skip_whole_subtrees() {
+    use alloc::format;
+    use alloc::string::{String, ToString};
+    let block = fresh(2048);
+    let reference = MemUnit::new(UNIT);
+    // 紧挨着 `/` 排序的字符（`!` `.` 在它前面，`0` 在它后面）、空段、NUL、和父目录同值。
+    let mut paths: Vec<String> = [
+        "/", "/a", "/a/", "/a/b", "/a/b/c", "/a/b/c/d", "/a/b0", "/a/b!", "/a/b.x", "/a//x", "/a/\0/y", "/a/\0", "/a!",
+        "/a.x", "/a0", "/a0/z", "/b", "/b/c", "/zz",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for i in 0..300 {
+        paths.push(format!("/a/b/deep{}/f{i}", i % 7));
+    }
+    let changes: Vec<Change> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Change::Create {
+            id: eid(i as u64),
+            tags: vec![Tag::new("fs", "path", p.as_str())],
+            content: None,
+        })
+        .collect();
+    for unit in [&block as &dyn Unit, &reference] {
+        unit.apply(&changes).unwrap();
+    }
+    let (ns, key) = (Namespace::new("fs"), Key::new("path"));
+    for parent in ["/", "/a/", "/a/b/", "/a/b/c/", "/a//", "/a/\0/", "/a0/", "/missing/", "", "/a/b/deep3/"] {
+        let p = Probe::Children { ns: &ns, key: &key, parent };
+        let got = block.snapshot().probe(&p).unwrap();
+        assert_eq!(got, reference.snapshot().probe(&p).unwrap(), "{parent:?}");
+    }
+    let names = |parent: &str| {
+        let snap = block.snapshot();
+        let mut out: Vec<String> = snap
+            .probe(&Probe::Children { ns: &ns, key: &key, parent })
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|id| match &snap.get(id).unwrap().unwrap().tags[0].value {
+                Value::Str(s) => s.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(names("/"), ["/a", "/a!", "/a.x", "/a0", "/b", "/zz"]);
+    assert_eq!(names("/a/"), ["/a/\0", "/a/b", "/a/b!", "/a/b.x", "/a/b0"]);
+    // The deep* directories have no value of their own, only files below them.
+    assert_eq!(names("/a/b/"), ["/a/b/c"]);
 }
 
 #[test]

@@ -33,6 +33,14 @@ pub enum Query {
         key: Key,
         prefix: String,
     },
+    /// 某个键的字符串值是 `parent` 下一层：以 `parent` 开头，余下的部分不空、不含 `/`。
+    /// 路径形式的值（`tagfs:hostfs_path` 这一类）用它列出一个目录的直接子项，`parent` 是
+    /// 目录的值加上 `/`。索引跳过更深的层级，代价只和直接子项的个数有关。
+    Children {
+        ns: Namespace,
+        key: Key,
+        parent: String,
+    },
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
@@ -45,6 +53,7 @@ pub enum Probe<'a> {
     Is(&'a Tag),
     Range { ns: &'a Namespace, key: &'a Key, lower: &'a Bound<Value>, upper: &'a Bound<Value> },
     Prefix { ns: &'a Namespace, key: &'a Key, prefix: &'a str },
+    Children { ns: &'a Namespace, key: &'a Key, parent: &'a str },
 }
 
 impl Query {
@@ -63,6 +72,7 @@ impl Query {
             Query::Is(tag) => Probe::Is(tag),
             Query::Range { ns, key, lower, upper } => Probe::Range { ns, key, lower, upper },
             Query::Prefix { ns, key, prefix } => Probe::Prefix { ns, key, prefix },
+            Query::Children { ns, key, parent } => Probe::Children { ns, key, parent },
             _ => return None,
         })
     }
@@ -92,8 +102,16 @@ impl Probe<'_> {
             Probe::Prefix { ns, key, prefix } => {
                 t.is(ns, key) && matches!(&t.value, Value::Str(s) if s.starts_with(prefix))
             }
+            Probe::Children { ns, key, parent } => {
+                t.is(ns, key) && matches!(&t.value, Value::Str(s) if is_child(s, parent))
+            }
         }
     }
+}
+
+/// `value` 是否在 `parent` 下一层。
+pub fn is_child(value: &str, parent: &str) -> bool {
+    value.strip_prefix(parent).is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 fn in_bounds(v: &Value, lower: &Bound<Value>, upper: &Bound<Value>) -> bool {
@@ -136,6 +154,20 @@ mod tests {
         assert!(!range(13, 20).matches(&t));
         let prefix = Query::Prefix { ns: Namespace::new("user"), key: Key::new("name"), prefix: "song".into() };
         assert!(prefix.matches(&t));
+    }
+
+    #[test]
+    fn children_are_one_level_down() {
+        let children = |v: &str, parent: &str| {
+            Query::Children { ns: Namespace::new("u"), key: Key::new("p"), parent: parent.into() }
+                .matches(&[Tag::new("u", "p", v)])
+        };
+        assert!(children("/a/b", "/a/"));
+        assert!(!children("/a/b/c", "/a/"), "deeper");
+        assert!(!children("/a/", "/a/"), "nothing below the parent");
+        assert!(!children("/ab", "/a/"));
+        assert!(children("/x", "/"));
+        assert!(!children("/x/y", "/"));
     }
 
     #[test]

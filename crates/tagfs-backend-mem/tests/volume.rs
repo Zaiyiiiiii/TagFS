@@ -169,6 +169,25 @@ fn tags_in_unreadable_namespaces_do_not_exist_for_the_caller() {
 }
 
 #[test]
+fn a_query_can_bring_the_entities_along() {
+    let mut v = volume(&[1, 2]);
+    let a = create(&mut v, &ALICE_IN_PLAYER, Some(1), vec![name("song"), Tag::new("app", "plays", 3u64)], b"abc");
+    let b = create(&mut v, &ALICE, Some(2), vec![name("note")], b"");
+    create(&mut v, &BOB, Some(1), vec![name("bob's")], b"");
+    // Same entities as `query`, with what `get` would give for each.
+    let q = Query::has("user", "name");
+    let got = v.query_entities(&ALICE, &q).unwrap();
+    assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), v.query(&ALICE, &q).unwrap());
+    for e in &got {
+        assert_eq!(e, &v.get(&ALICE, &e.id).unwrap());
+    }
+    assert!(got.iter().all(|e| e.id == a || e.id == b));
+    // Tags the caller can't read aren't there, so nothing matches on them either.
+    assert!(v.query_entities(&ALICE, &Query::has("app", "plays")).unwrap().is_empty());
+    assert_eq!(v.query_entities(&ALICE_IN_PLAYER, &Query::has("app", "plays")).unwrap()[0].size, 3);
+}
+
+#[test]
 fn queries_can_be_read_page_by_page() {
     let mut v = volume(&[1, 2]);
     let mut all = Vec::new();

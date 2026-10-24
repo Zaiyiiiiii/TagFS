@@ -902,36 +902,8 @@ impl DirUnit {
                 }
             }
         }
-        let in_scope = |p: &HostPath| match &scopes {
-            None => true,
-            Some(scopes) => {
-                let segs = p.segments();
-                scopes.iter().any(|s| segs.starts_with(s))
-            }
-        };
-
-        let snap = self.image.snapshot();
-        let (ns, key) = hostfs_key();
-        let mut known: Vec<(EntityId, HostPath)> = Vec::new();
-        for id in snap.probe(&Probe::Has { ns: &ns, key: &key })?.unwrap_or_default() {
-            let rec = snap.get(&id)?.ok_or(UnitError::Corrupt)?;
-            if let Some(p) = path_of(&rec.tags)?
-                && in_scope(&p)
-            {
-                known.push((id, p));
-            }
-        }
-        let (dns, dkey) = dir_key();
-        let mut known_dirs: Vec<(EntityId, HostPath)> = Vec::new();
-        for id in snap.probe(&Probe::Has { ns: &dns, key: &dkey })?.unwrap_or_default() {
-            let rec = snap.get(&id)?.ok_or(UnitError::Corrupt)?;
-            if let Some(p) = dir_of(&rec.tags)?
-                && in_scope(&p)
-            {
-                known_dirs.push((id, p));
-            }
-        }
-        drop(snap);
+        let known = self.known(&hostfs_key(), &scopes)?;
+        let known_dirs = self.known(&dir_key(), &scopes)?;
         let Found { files: mut found, mut dirs } = found;
         let identities: BTreeMap<Vec<u8>, Ident> =
             self.image.aux_list(AUX_IDENTITY)?.into_iter().filter_map(|(k, v)| Some((k, Ident::decode(&v)?))).collect();
@@ -1007,6 +979,36 @@ impl DirUnit {
             self.image.commit_batch(&Batch { changes: &changes, aux: &aux, ..Batch::default() })?;
         }
         Ok(report)
+    }
+
+    /// 镜像里已知的、范围内的映射路径（`key` 是文件或目录的键）。直接读 Tag 索引：路径就在索引条目里，
+    /// 不逐个取实体；范围只查范围本身和它下面的路径，不碰范围外的。
+    fn known(
+        &self,
+        key: &(Namespace, Key),
+        scopes: &Option<BTreeSet<Scope>>,
+    ) -> Result<Vec<(EntityId, HostPath)>, UnitError> {
+        let (ns, key) = (&key.0, &key.1);
+        let mut hits = Vec::new();
+        match scopes {
+            None => hits = self.image.index(&Probe::Has { ns, key })?,
+            Some(scopes) => {
+                for s in scopes {
+                    let value = format!("/{}", s.join("/"));
+                    hits.extend(self.image.index(&Probe::Is(&Tag::new(ns.as_str(), key.as_str(), value.as_str())))?);
+                    let below = format!("{value}/");
+                    hits.extend(self.image.index(&Probe::Prefix { ns, key, prefix: &below })?);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (id, tag) in hits {
+            let Value::Str(v) = &tag.value else { return Err(INVALID_PATH) };
+            out.push((id, HostPath::parse(v)?));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// 收集一个范围里的文件和目录：范围是目录就连它自己整个走一遍，是文件就只看它。

@@ -327,6 +327,33 @@ impl<P: Policy> Volume<P> {
         Ok(out)
     }
 
+    /// 同 [`Volume::query`]，连同实体一起返回（Tag 只含调用者看得到的命名空间），按 EntityId 排序。
+    /// 判断可见性时已经取过记录，调用者要用 Tag 时不必再逐个 [`Volume::get`]。
+    pub fn query_entities(&self, ctx: &P::Context, query: &Query) -> Result<Vec<Entity>, Error> {
+        let mut out: BTreeMap<EntityId, Entity> = BTreeMap::new();
+        for u in self.units() {
+            let snap = u.snapshot();
+            let candidates = match candidates(&*snap, query)? {
+                Some(c) => c,
+                None => snap.all()?,
+            };
+            for id in candidates {
+                if out.contains_key(&id) {
+                    continue;
+                }
+                if let Some(r) = snap.get(&id)?
+                    && self.visible(ctx, &r.tags)
+                {
+                    let tags = self.readable(ctx, r.tags);
+                    if query.matches(&tags) {
+                        out.insert(id, Entity { id, tags, size: r.size });
+                    }
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
     pub fn begin<'a>(&'a self, ctx: &'a P::Context) -> Txn<'a, P> {
         Txn {
             vol: self,

@@ -56,7 +56,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use tagfs_core::{Change, EntityId, EntityRecord, Probe, Snapshot, StageId, TxnId, TxnInfo, Unit, UnitError, UnitId};
+use tagfs_core::{
+    Change, EntityId, EntityRecord, Probe, Snapshot, StageId, Tag, TxnId, TxnInfo, Unit, UnitError, UnitId,
+};
 use tagfs_device::{BlockDevice, Share};
 use tagfs_sync::{Mutex, MutexGuard};
 
@@ -1122,6 +1124,12 @@ impl<D: BlockDevice + 'static> BlockUnit<D> {
             }
             Ok(())
         })
+    }
+
+    /// 直接读 Tag 索引：满足叶子条件的实体和命中的 Tag，按索引的顺序（一个实体在同一个键上有几个值
+    /// 就出现几次）。只要值的时候（例如一个键下全部的路径）不必再逐个取实体。
+    pub fn index(&self, probe: &Probe<'_>) -> Result<Vec<(EntityId, Tag)>, UnitError> {
+        self.view(|v| v.probe_tags(probe))
     }
 
     /// 现有的全部暂存，含别的进程的。
