@@ -26,7 +26,8 @@
 //!
 //! 之后断电，挂载时按意图记录把第 2、3 步做完：宿主操作都可以重做。
 //!
-//! 多个进程可以同时挂载同一个目录。元数据修改和对账在进程之间一次一个（`/.tagfs/meta.lock` 上的文件锁）；
+//! 多个进程可以同时挂载同一个目录。元数据修改和对账在进程之间一次一个（`/.tagfs/meta.lock` 上的锁：系统文件锁，
+//! 或者它在这个目录上不起作用时自己实现的锁，见 `tagfs_device_host::lock`）；
 //! 拿到这把锁时如果还有意图记录，说明做这次修改的进程中途不在了，接着把它做完。内容读写不用这把锁。
 //! 每个进程各自监听宿主上的改动；同一个改动被几个进程先后对账，后来的看到的已经是对过的结果。
 //!
@@ -601,12 +602,12 @@ type Scope = Vec<String>;
 /// 持有元数据修改的锁，放掉时解锁。
 struct MetaGuard<'a> {
     _local: tagfs_sync::MutexGuard<'a, ()>,
-    file: &'a fs::File,
+    lock: &'a tagfs_device_host::lock::Lock,
 }
 
 impl Drop for MetaGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        self.lock.unlock();
     }
 }
 
@@ -621,9 +622,9 @@ pub struct DirUnit {
     image: ImageUnit,
     ids: Mutex<Box<dyn IdSource + Send>>,
     /// 元数据修改和对账一次一个：它们都会搬动宿主上的文件。内容读写不用它。本进程里用这把锁排，
-    /// 进程之间用 `meta_file` 上的文件锁排，见 [`DirUnit::meta`]。
+    /// 进程之间用 `meta_lock`（`/.tagfs/meta.lock`）排，见 [`DirUnit::meta`]。
     meta: Mutex<()>,
-    meta_file: fs::File,
+    meta_lock: tagfs_device_host::lock::Lock,
     watch: Option<Watch>,
     /// 取快照前同步失败的错误，下一个能报错的调用把它报出来。
     sync_error: Mutex<Option<UnitError>>,
@@ -648,7 +649,30 @@ impl DirUnit {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(DirError::AlreadyExists),
             Err(e) => return Err(e.into()),
         }
-        let image = tagfs_backend_file::create(own.join(IMAGE), unit)?;
+        // 中途失败或断电留下的半成品，下次 `open_or_create` 会接着建好。
+        let image = tagfs_backend_file::open_or_create_own(own.join(IMAGE), unit)?;
+        Self::start(root, image, ids)
+    }
+
+    /// 挂载 `root` 上的目录单元，还没有就在这个目录上建一个（编号 `unit`）。多个进程可以同时调用：只有一个新建，
+    /// 其余的等它建完再挂载；新建到一半的进程不在了（`.tagfs/` 在、镜像没建完），由下一个调用的接着建好
+    /// （见 `tagfs_backend_file::open_or_create_own`）。
+    pub fn open_or_create(
+        root: impl AsRef<Path>,
+        unit: UnitId,
+        ids: Box<dyn IdSource + Send>,
+    ) -> Result<(Self, ScanReport), DirError> {
+        let root = fs::canonicalize(root)?;
+        if !fs::metadata(&root)?.is_dir() {
+            return Err(DirError::NotADirectory);
+        }
+        let own = root.join(RESERVED);
+        match fs::create_dir(&own) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let image = tagfs_backend_file::open_or_create_own(own.join(IMAGE), unit)?;
         Self::start(root, image, ids)
     }
 
@@ -664,12 +688,8 @@ impl DirUnit {
     }
 
     fn start(root: PathBuf, image: ImageUnit, ids: Box<dyn IdSource + Send>) -> Result<(Self, ScanReport), DirError> {
-        let meta_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join(RESERVED).join(META_LOCK))?;
+        let own = root.join(RESERVED);
+        let meta_lock = tagfs_device_host::lock::Lock::open(&own.join(META_LOCK), tagfs_device_host::lock::mode(&own)?)?;
         // 先开始监听，再对账：对账期间发生的改动不会漏掉。
         let watch = start_watch(&root);
         let me = DirUnit {
@@ -677,7 +697,7 @@ impl DirUnit {
             image,
             ids: Mutex::new(ids),
             meta: Mutex::new(()),
-            meta_file,
+            meta_lock,
             watch,
             sync_error: Mutex::new(None),
             dirty: Mutex::new(BTreeSet::new()),
@@ -695,8 +715,8 @@ impl DirUnit {
     /// （断电、进程崩溃，或者这个进程自己之前出错），先把它做完。
     fn meta(&self) -> Result<MetaGuard<'_>, UnitError> {
         let local = self.meta.lock();
-        self.meta_file.lock().map_err(io_err)?;
-        let guard = MetaGuard { _local: local, file: &self.meta_file };
+        self.meta_lock.lock().map_err(io_err)?;
+        let guard = MetaGuard { _local: local, lock: &self.meta_lock };
         if let Some(raw) = self.image.aux_get(AUX_INTENT)? {
             let intent = Intent::decode(&raw)?;
             self.carry_out(&intent)?;

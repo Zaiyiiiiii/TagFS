@@ -48,6 +48,26 @@ fn fresh(name: &str) -> (PathBuf, DirUnit) {
     (root, unit)
 }
 
+#[test]
+fn open_or_create_finishes_a_half_made_unit() {
+    // 上一次新建在 `.tagfs/` 建好之后就断了：没有镜像，或者镜像没格式化完。
+    for leftover in [None, Some(vec![0u8; 8192])] {
+        let root = scratch("half-made");
+        fs::write(root.join("song.mp3"), b"la").unwrap();
+        fs::create_dir(root.join(RESERVED)).unwrap();
+        if let Some(bytes) = &leftover {
+            fs::write(root.join(RESERVED).join(IMAGE), bytes).unwrap();
+        }
+        let (unit, _) = DirUnit::open_or_create(&root, UnitId([5; 16]), ids()).unwrap();
+        assert_eq!(unit.id(), UnitId([5; 16]));
+        assert!(by_path(&unit, "/song.mp3").is_some(), "the directory's files are mapped");
+        drop(unit);
+        // 之后就是普通的已有单元。
+        let (unit, _) = DirUnit::open_or_create(&root, UnitId([6; 16]), ids()).unwrap();
+        assert_eq!(unit.id(), UnitId([5; 16]));
+    }
+}
+
 /// 新建实体的修改：内容先写进暂存。
 fn new_entity(u: &dyn Unit, id: EntityId, tags: Vec<Tag>, data: &[u8]) -> Change {
     let stage = u.stage().unwrap();

@@ -418,6 +418,7 @@ dependencies = [
  "tagfs-backend-mem",
  "tagfs-block",
  "tagfs-core",
+ "tagfs-device-host",
  "tagfs-proto",
  "tagfs-sync",
 ]

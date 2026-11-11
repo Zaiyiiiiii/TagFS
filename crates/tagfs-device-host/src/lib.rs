@@ -5,7 +5,10 @@
 //!
 //! 普通文件可以由多个进程同时打开（[`FileDevice::create_shared`]、[`FileDevice::open_shared`]）：
 //! 进程之间用文件锁协调（[`Share`]）。锁放在文件旁边的锁目录里（`<文件名>.locks/`），不锁文件本身：
-//! Windows 上的文件锁是强制的，锁住的范围别人读写不了。
+//! Windows 上的文件锁是强制的，锁住的范围别人读写不了。系统文件锁在那里不起作用时换成自己实现的锁
+//! （[`lock`]），锁文件的位置不变。
+
+pub mod lock;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
@@ -68,24 +71,6 @@ impl FileDevice {
         Ok(FileDevice { share: Some(share), ..Self::create(path, capacity, block_size)? })
     }
 
-    /// 新建可以由多个进程同时使用的文件设备；文件已经存在时失败（`AlreadyExists`），不碰它。
-    /// 多个进程同时新建同一个文件时只有一个成功，其余的转而打开它。
-    pub fn create_new_shared(path: impl AsRef<Path>, capacity: u64, block_size: u32) -> io::Result<Self> {
-        let path = path.as_ref();
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        let share = FileShare::open(&lock_dir(path))?;
-        file.set_len(capacity)?;
-        Ok(FileDevice {
-            file,
-            block_size,
-            capacity: AtomicU64::new(round_down(capacity, block_size)),
-            read_only: false,
-            growable: true,
-            growing: tagfs_sync::Mutex::new(()),
-            share: Some(share),
-        })
-    }
-
     /// 打开已有的文件，和别的进程共用。只用于普通文件。
     pub fn open_shared(path: impl AsRef<Path>, block_size: u32) -> io::Result<Self> {
         let path = path.as_ref();
@@ -101,21 +86,22 @@ pub fn lock_dir(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// 用锁目录里的文件锁实现的 [`Share`]。
+/// 用锁目录里的锁（[`lock`]：系统文件锁，或者那里不起作用时自己实现的锁）实现的 [`Share`]。
 ///
 /// - `writer`：写者锁，独占。
 /// - `readers`：读者锁，读的时候共享持有。
 /// - `owners/<身份>`：每个打开设备的进程一个，独占持有到关闭。锁还被持有，那个进程就还在；
 ///   进程崩溃时系统替它放掉锁。
 struct FileShare {
-    writer: File,
-    readers: File,
+    mode: lock::Mode,
+    writer: lock::Lock,
+    readers: lock::Shared,
     /// 本进程持有读者锁的次数。
     held: std::sync::Mutex<usize>,
     owners: PathBuf,
     owner: u64,
     /// 本进程的属主锁，持有到关闭。
-    owner_file: Option<File>,
+    owner_lock: Option<lock::Lock>,
 }
 
 fn random_owner() -> u64 {
@@ -129,30 +115,25 @@ fn random_owner() -> u64 {
     }
 }
 
-fn lock_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
-}
-
-fn would_block(e: &fs::TryLockError) -> bool {
-    matches!(e, fs::TryLockError::WouldBlock)
-}
-
 impl FileShare {
     fn open(dir: &Path) -> io::Result<Self> {
+        let mode = lock::mode(dir)?;
         let owners = dir.join("owners");
         fs::create_dir_all(&owners)?;
-        let writer = lock_file(&dir.join("writer"))?;
-        let readers = lock_file(&dir.join("readers"))?;
-        probe_locks(&dir.join("probe"))?;
-        // 先在临时名字下拿到锁再改名，免得别人在拿锁之前看到它、当它已经不在了。
+        let writer = lock::Lock::open(&dir.join("writer"), mode)?;
+        let readers = lock::Shared::open(&dir.join("readers"), mode)?;
+        // 拿着锁才让属主文件出现，免得别人在拿锁之前看到它、当它已经不在了。
         let owner = random_owner();
-        let name = format!("{owner:016x}");
-        let tmp = owners.join(format!("{name}.new"));
-        let owner_file = lock_file(&tmp)?;
-        owner_file.lock()?;
-        fs::rename(&tmp, owners.join(&name))?;
-        let me =
-            FileShare { writer, readers, held: std::sync::Mutex::new(0), owners, owner, owner_file: Some(owner_file) };
+        let owner_lock = lock::Lock::create_held(&owners.join(format!("{owner:016x}")), mode)?;
+        let me = FileShare {
+            mode,
+            writer,
+            readers,
+            held: std::sync::Mutex::new(0),
+            owners,
+            owner,
+            owner_lock: Some(owner_lock),
+        };
         me.sweep();
         Ok(me)
     }
@@ -171,36 +152,17 @@ impl FileShare {
             if name == mine || name.ends_with(".new") {
                 continue;
             }
-            if let Ok(f) = OpenOptions::new().read(true).write(true).open(&path)
-                && f.try_lock().is_ok()
-            {
-                let _ = f.unlock();
-                drop(f);
+            if lock::held_elsewhere(&path, self.mode).is_ok_and(|held| !held) {
                 let _ = fs::remove_file(&path);
             }
         }
     }
 }
 
-/// 确认这里的文件锁真的起作用：同一个文件开两次，一边锁住时另一边必须拿不到。
-/// 有的文件系统（某些网络盘、FUSE）上锁是空操作，多个进程同时写会把单元写坏，这时拒绝打开。
-fn probe_locks(path: &Path) -> io::Result<()> {
-    let a = lock_file(path)?;
-    let b = lock_file(path)?;
-    a.lock()?;
-    let r = b.try_lock();
-    let _ = a.unlock();
-    match r {
-        Err(e) if would_block(&e) => Ok(()),
-        Err(fs::TryLockError::Error(e)) => Err(e),
-        _ => Err(io::Error::new(io::ErrorKind::Unsupported, "file locks have no effect on this file system")),
-    }
-}
-
 impl Drop for FileShare {
     fn drop(&mut self) {
         // 先关掉再删：Windows 上删一个还开着的文件会让它处于“删除中”，别人打不开也认不出它已经不在。
-        drop(self.owner_file.take());
+        drop(self.owner_lock.take());
         let _ = fs::remove_file(self.owner_path(self.owner));
     }
 }
@@ -211,13 +173,13 @@ impl Share for FileShare {
     }
 
     fn unlock_writer(&self) {
-        let _ = self.writer.unlock();
+        self.writer.unlock();
     }
 
     fn hold_readers(&self) -> Result<(), DeviceError> {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if *held == 0 {
-            self.readers.lock_shared().map_err(io_err)?;
+            self.readers.hold().map_err(io_err)?;
         }
         *held += 1;
         Ok(())
@@ -227,29 +189,14 @@ impl Share for FileShare {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         *held -= 1;
         if *held == 0 {
-            let _ = self.readers.unlock();
+            self.readers.release();
         }
     }
 
     fn readers_absent(&self) -> Result<bool, DeviceError> {
-        // 本进程自己的读者不算：先放掉自己的共享锁，试着独占，再拿回来。别的进程只有写者才会独占它，
-        // 而写者就是我们，所以拿回来不会等。
+        // 本进程自己的读者不算。别的进程只有写者才会独占读者锁，而写者就是我们，所以不会等。
         let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        if *held > 0 {
-            let _ = self.readers.unlock();
-        }
-        let absent = match self.readers.try_lock() {
-            Ok(()) => {
-                let _ = self.readers.unlock();
-                Ok(true)
-            }
-            Err(e) if would_block(&e) => Ok(false),
-            Err(_) => Err(DeviceError::Io),
-        };
-        if *held > 0 {
-            self.readers.lock_shared().map_err(io_err)?;
-        }
-        absent
+        self.readers.others_absent(*held > 0).map_err(io_err)
     }
 
     fn owner(&self) -> u64 {
@@ -263,22 +210,8 @@ impl Share for FileShare {
         if owner == 0 {
             return Ok(false);
         }
-        let f = match OpenOptions::new().read(true).write(true).open(self.owner_path(owner)) {
-            Ok(f) => f,
-            // 没有这个文件，或者它正被删掉（Windows）：那个进程已经不在了。
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => {
-                return Ok(false);
-            }
-            Err(_) => return Err(DeviceError::Io),
-        };
-        match f.try_lock() {
-            Ok(()) => {
-                let _ = f.unlock();
-                Ok(false)
-            }
-            Err(e) if would_block(&e) => Ok(true),
-            Err(_) => Err(DeviceError::Io),
-        }
+        // 没有属主文件（或者它正被删掉），那个进程就已经不在了。
+        lock::held_elsewhere(&self.owner_path(owner), self.mode).map_err(io_err)
     }
 }
 
